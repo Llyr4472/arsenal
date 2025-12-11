@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>XSS Test</title>
+    <link>http://example.com</link>
+    <item>
+      <title>Click Me</title>
+      <!-- The Javascript Payload -->
+      <link>javascript:alert(document.domain)</link>
+    </item>
+  </channel>
+</rss>
