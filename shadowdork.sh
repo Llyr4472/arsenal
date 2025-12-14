@@ -13,14 +13,17 @@ YELLOW='\033[1;33m'
 RESET='\033[0m'
 
 DOMAIN=$1
+AUTO_OPEN=$2
 
 if [ -z "$DOMAIN" ]; then
-    echo -e "${RED}Usage: $0 target.com${RESET}"
+    echo -e "${RED}Usage: $0 target.com [--open]${RESET}"
     exit 1
 fi
 
 # Extract keyword (e.g., "tesla" from "tesla.com") for SaaS searches
 KEYWORD=$(echo "$DOMAIN" | cut -d. -f1)
+OUTPUT_FILE="dorks_${DOMAIN}.txt"
+> "$OUTPUT_FILE"
 
 echo -e "${BLUE}_________________________________________________${RESET}"
 echo -e "${YELLOW}           S H A D O W  D O R K              ${RESET}"
@@ -37,6 +40,7 @@ dork_direct() {
     LINK="https://www.google.com/search?q=site:$DOMAIN+$QUERY"
     echo -e "${YELLOW}[+] $TITLE${RESET}"
     echo "$LINK"
+    echo "$LINK" >> "$OUTPUT_FILE"
     echo ""
 }
 
@@ -47,6 +51,7 @@ dork_saas() {
     LINK="https://www.google.com/search?q=site:$SITE+\"$KEYWORD\"+OR+\"$DOMAIN\""
     echo -e "${BLUE}[+] $TITLE (External/SaaS)${RESET}"
     echo "$LINK"
+    echo "$LINK" >> "$OUTPUT_FILE"
     echo ""
 }
 
@@ -113,4 +118,29 @@ dork_direct "Directory Listing (Index Of)" \
 dork_direct "Admin/Login Portals" \
 "inurl:admin+OR+inurl:dashboard+OR+intitle:\"admin panel\"+OR+inurl:login"
 
-echo -e "${YELLOW}Done.${RESET}"
+echo -e "${YELLOW}Links saved to: $OUTPUT_FILE${RESET}"
+
+# Auto-Opener Logic
+if [ "$AUTO_OPEN" == "--open" ]; then
+    echo -e "\033[1;32mStarting Auto-Opener...\033[0m"
+    
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        OPEN_CMD="xdg-open"
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        OPEN_CMD="open"
+    else
+        OPEN_CMD="cmd.exe /C start"
+    fi
+
+    count=0
+    while IFS= read -r line; do
+        if [[ $line == http* ]]; then
+            $OPEN_CMD "$line"
+            ((count++))
+            if (( count % 5 == 0 )); then
+                echo -e "\033[1;31mOpened 5 tabs. Pausing...\033[0m"
+                read -p "Press Enter to continue..."
+            fi
+        fi
+    done < "$OUTPUT_FILE"
+fi
