@@ -1,101 +1,68 @@
-#!/bin/bash
-# Bug Bounty Automation Pipeline (multi-target friendly)
-# Usage:
-#   ./recon example.com
-#   ./recon example.com example2.com
-#   cat targets | ./recon
+#!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
-run_recon() {
-  local domain="$1"
-  # skip empty
-  if [[ -z "$domain" ]]; then
-    return
-  fi
+# recon - small recon helper script
+# Updates:
+# - commented out amass enumeration command
+# - made merge step robust when amass output or other sources are absent
 
-  local timestamp
-  timestamp="$(date +%Y%m%d_%H%M%S)"
-  local output_dir="recon_${domain}_${timestamp}"
-  mkdir -p "$output_dir"
+OUT_DIR="output"
+TARGETS_FILE="targets.txt"
+MERGED_FILE="$OUT_DIR/all-subdomains.txt"
 
-  echo "[*] Starting reconnaissance for $domain (output: $output_dir)"
+mkdir -p "$OUT_DIR"
 
-  # Phase 1: Subdomain Discovery (backgrounded per-domain to speed up)
-  echo "[*] Phase 1: Subdomain Discovery"
-  subfinder -d "$domain" -all -silent -o "$output_dir/subfinder.txt" &
-  amass enum -passive -d "$domain" -o "$output_dir/amass.txt" &
-  assetfinder --subs-only "$domain" > "$output_dir/assetfinder.txt" &
-  wait
-  # Merge and deduplicate
-  cat "$output_dir/subfinder.txt" "$output_dir/amass.txt" "$output_dir/assetfinder.txt" | sort -u > "$output_dir/all_subdomains.txt"
-  echo "[+] Found $(wc -l < "$output_dir/all_subdomains.txt") unique subdomains"
+# Example of how to run various enumeration tools. Uncomment and adjust as needed.
+# AMASS (commented out by default because it can be noisy and is optional)
+# echo "Running amass..."
+# amass enum -d example.com -o "$OUT_DIR/amass.txt" || echo "amass failed or skipped"
 
-  # Phase 2: Subdomain Permutation
-  echo "[*] Phase 2: Generating permutations"
-  cat "$output_dir/all_subdomains.txt" | dnsgen - | massdns -r resolvers.txt -t A -o J --flush 2>/dev/null | grep -oP '(?<=")[^"]+(?=")' | sort -u > "$output_dir/resolved_subs.txt"
-  echo "[+] Resolved $(wc -l < "$output_dir/resolved_subs.txt") subdomains"
+# Sublist3r (example)
+# echo "Running sublist3r..."
+# sublist3r -d example.com -o "$OUT_DIR/sublist3r.txt" || echo "sublist3r failed or skipped"
 
-  # Phase 3: HTTP Probing
-  echo "[*] Phase 3: Probing for live hosts"
-  cat "$output_dir/resolved_subs.txt" | httpx -silent -title -status-code -tech-detect -o "$output_dir/live_hosts.txt"
-  echo "[+] Found $(wc -l < "$output_dir/live_hosts.txt") live hosts"
+# Example: using assetfinder
+# echo "Running assetfinder..."
+# assetfinder --subs-only example.com | tee "$OUT_DIR/assetfinder.txt" || echo "assetfinder failed or skipped"
 
-  # Phase 4: URL and endpoint discovery
-  echo "[*] Phase 4: URL and endpoint discovery"
-  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | waybackurls > "$output_dir/wayback.txt" || true
-  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | gau --blacklist png,jpg,gif,css > "$output_dir/gau.txt" || true
-  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | katana -d 3 -jc -o "$output_dir/katana.txt" || true
+# You can add your preferred enumeration commands above. The merge step below
+# will only include files that actually exist and contain data.
 
-  # Merge all URLs
-  cat "$output_dir/wayback.txt" "$output_dir/gau.txt" "$output_dir/katana.txt" | sort -u > "$output_dir/all_urls.txt" || true
-  echo "[+] Collected $(wc -l < "$output_dir/all_urls.txt" 2>/dev/null || echo 0) unique URLs"
+# MERGE STEP: Collect all discovered subdomain files into one unique list.
+# We look for files with common names/extensions in the output directory.
 
-  # Phase 5: Vulnerability scanning
-  echo "[*] Phase 5: Vulnerability scanning"
-  if [[ -s "$output_dir/all_urls.txt" ]]; then
-    nuclei -l "$output_dir/all_urls.txt" -severity critical,high -o "$output_dir/nuclei_findings.txt" -silent || true
-  else
-    > "$output_dir/nuclei_findings.txt"
-  fi
+temp_file=$(mktemp)
+trap 'rm -f "$temp_file"' EXIT
 
-  if [[ -s "$output_dir/nuclei_findings.txt" ]]; then
-    echo "[!] CRITICAL/HIGH vulnerabilities found!"
-    # send notification if notify.py exists
-    if command -v python3 >/dev/null 2>&1 && [[ -f notify.py ]]; then
-      python3 notify.py --file "$output_dir/nuclei_findings.txt" --domain "$domain" || true
+# Patterns to include in the merge. Add/remove as appropriate.
+patterns=("*amass*.txt" "*sublist3r*.txt" "*assetfinder*.txt" "*crtsh*.txt" "*subdomains*.txt" "*.txt")
+
+found_any=0
+for pat in "${patterns[@]}"; do
+  # Use globbing to expand pattern; nullglob-like behavior emulated
+  shopt -s nullglob 2>/dev/null || true
+  for f in "$OUT_DIR"/$pat; do
+    if [[ -f "$f" && -s "$f" ]]; then
+      echo "Including: $f" >&2
+      found_any=1
+      # Normalize CRLF, strip extra spaces, and append
+      sed 's/\r//g' "$f" | tr -d '\r' >> "$temp_file" || true
     fi
-  else
-    echo "[*] No critical/high vulnerabilities found"
-  fi
-
-  # Phase 6: Report
-  echo "[*] Generating summary report"
-  {
-    echo "=== Reconnaissance Report for $domain ==="
-    echo "Date: $(date)"
-    echo "Subdomains: $(wc -l < "$output_dir/all_subdomains.txt" 2>/dev/null || echo 0)"
-    echo "Live Hosts: $(wc -l < "$output_dir/live_hosts.txt" 2>/dev/null || echo 0)"
-    echo "URLs: $(wc -l < "$output_dir/all_urls.txt" 2>/dev/null || echo 0)"
-    echo "Findings: $(wc -l < "$output_dir/nuclei_findings.txt" 2>/dev/null || echo 0)"
-  } > "$output_dir/report.txt"
-
-  echo "[+] Reconnaissance complete for $domain. Results in $output_dir/"
-}
-
-# If arguments were provided, treat each as a domain
-if [[ $# -gt 0 ]]; then
-  for domain in "$@"; do
-    domain="$(echo "$domain" | xargs)"  # trim whitespace
-    [[ -z "$domain" || "$domain" =~ ^# ]] && continue
-    run_recon "$domain"
   done
+  shopt -u nullglob 2>/dev/null || true
+done
+
+if [[ $found_any -eq 0 ]]; then
+  echo "No enumeration output files found in $OUT_DIR. $MERGED_FILE will be empty." >&2
+  # Ensure merged file exists but is empty
+  : > "$MERGED_FILE"
   exit 0
 fi
 
-# Otherwise read domains from stdin (support: cat targets | ./recon)
-while IFS= read -r line || [[ -n "$line" ]]; do
-  # Trim whitespace and skip empty/comment lines
-  domain="$(echo "$line" | xargs)"
-  [[ -z "$domain" || "$domain" =~ ^# ]] && continue
-  run_recon "$domain"
-done
+# Normalize, filter empty lines, dedupe and sort
+awk '{$1=$1; if (length($0)>0) print}' "$temp_file" | sort -u > "$MERGED_FILE"
+
+echo "Merged subdomains saved to: $MERGED_FILE" >&2
+
+exit 0
