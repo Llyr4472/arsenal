@@ -1,0 +1,101 @@
+#!/bin/bash
+# Bug Bounty Automation Pipeline (multi-target friendly)
+# Usage:
+#   ./recon example.com
+#   ./recon example.com example2.com
+#   cat targets | ./recon
+set -euo pipefail
+
+run_recon() {
+  local domain="$1"
+  # skip empty
+  if [[ -z "$domain" ]]; then
+    return
+  fi
+
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  local output_dir="recon_${domain}_${timestamp}"
+  mkdir -p "$output_dir"
+
+  echo "[*] Starting reconnaissance for $domain (output: $output_dir)"
+
+  # Phase 1: Subdomain Discovery (backgrounded per-domain to speed up)
+  echo "[*] Phase 1: Subdomain Discovery"
+  subfinder -d "$domain" -all -silent -o "$output_dir/subfinder.txt" &
+  amass enum -passive -d "$domain" -o "$output_dir/amass.txt" &
+  assetfinder --subs-only "$domain" > "$output_dir/assetfinder.txt" &
+  wait
+  # Merge and deduplicate
+  cat "$output_dir/subfinder.txt" "$output_dir/amass.txt" "$output_dir/assetfinder.txt" | sort -u > "$output_dir/all_subdomains.txt"
+  echo "[+] Found $(wc -l < "$output_dir/all_subdomains.txt") unique subdomains"
+
+  # Phase 2: Subdomain Permutation
+  echo "[*] Phase 2: Generating permutations"
+  cat "$output_dir/all_subdomains.txt" | dnsgen - | massdns -r resolvers.txt -t A -o J --flush 2>/dev/null | grep -oP '(?<=")[^"]+(?=")' | sort -u > "$output_dir/resolved_subs.txt"
+  echo "[+] Resolved $(wc -l < "$output_dir/resolved_subs.txt") subdomains"
+
+  # Phase 3: HTTP Probing
+  echo "[*] Phase 3: Probing for live hosts"
+  cat "$output_dir/resolved_subs.txt" | httpx -silent -title -status-code -tech-detect -o "$output_dir/live_hosts.txt"
+  echo "[+] Found $(wc -l < "$output_dir/live_hosts.txt") live hosts"
+
+  # Phase 4: URL and endpoint discovery
+  echo "[*] Phase 4: URL and endpoint discovery"
+  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | waybackurls > "$output_dir/wayback.txt" || true
+  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | gau --blacklist png,jpg,gif,css > "$output_dir/gau.txt" || true
+  cat "$output_dir/live_hosts.txt" | awk '{print $1}' | katana -d 3 -jc -o "$output_dir/katana.txt" || true
+
+  # Merge all URLs
+  cat "$output_dir/wayback.txt" "$output_dir/gau.txt" "$output_dir/katana.txt" | sort -u > "$output_dir/all_urls.txt" || true
+  echo "[+] Collected $(wc -l < "$output_dir/all_urls.txt" 2>/dev/null || echo 0) unique URLs"
+
+  # Phase 5: Vulnerability scanning
+  echo "[*] Phase 5: Vulnerability scanning"
+  if [[ -s "$output_dir/all_urls.txt" ]]; then
+    nuclei -l "$output_dir/all_urls.txt" -severity critical,high -o "$output_dir/nuclei_findings.txt" -silent || true
+  else
+    > "$output_dir/nuclei_findings.txt"
+  fi
+
+  if [[ -s "$output_dir/nuclei_findings.txt" ]]; then
+    echo "[!] CRITICAL/HIGH vulnerabilities found!"
+    # send notification if notify.py exists
+    if command -v python3 >/dev/null 2>&1 && [[ -f notify.py ]]; then
+      python3 notify.py --file "$output_dir/nuclei_findings.txt" --domain "$domain" || true
+    fi
+  else
+    echo "[*] No critical/high vulnerabilities found"
+  fi
+
+  # Phase 6: Report
+  echo "[*] Generating summary report"
+  {
+    echo "=== Reconnaissance Report for $domain ==="
+    echo "Date: $(date)"
+    echo "Subdomains: $(wc -l < "$output_dir/all_subdomains.txt" 2>/dev/null || echo 0)"
+    echo "Live Hosts: $(wc -l < "$output_dir/live_hosts.txt" 2>/dev/null || echo 0)"
+    echo "URLs: $(wc -l < "$output_dir/all_urls.txt" 2>/dev/null || echo 0)"
+    echo "Findings: $(wc -l < "$output_dir/nuclei_findings.txt" 2>/dev/null || echo 0)"
+  } > "$output_dir/report.txt"
+
+  echo "[+] Reconnaissance complete for $domain. Results in $output_dir/"
+}
+
+# If arguments were provided, treat each as a domain
+if [[ $# -gt 0 ]]; then
+  for domain in "$@"; do
+    domain="$(echo "$domain" | xargs)"  # trim whitespace
+    [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+    run_recon "$domain"
+  done
+  exit 0
+fi
+
+# Otherwise read domains from stdin (support: cat targets | ./recon)
+while IFS= read -r line || [[ -n "$line" ]]; do
+  # Trim whitespace and skip empty/comment lines
+  domain="$(echo "$line" | xargs)"
+  [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+  run_recon "$domain"
+done
