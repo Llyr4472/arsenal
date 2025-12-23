@@ -1,12 +1,12 @@
-#!/usr/bin/env bash
-
-if [ -z "$1" ]; then
-  echo "Usage: live <domain>"
-  exit 1
-fi
-
-DOMAIN="$1"
-
-subfinder -all -d "$DOMAIN" -silent \
-  | httpx -sc -title -ip \
-  > "subdomains_${DOMAIN}.txt"
+#!/bin/bash
+domain=$1
+# Run multiple tools in parallel
+subfinder -d $domain -silent | tee -a all_subs.txt &
+amass enum -passive -d $domain -o amass.txt &
+assetfinder --subs-only $domain | tee -a all_subs.txt &
+# Wait for all to complete
+wait
+# Merge and deduplicate
+cat all_subs.txt amass.txt | sort -u > unique_subs.txt
+# Generate subdomain permutations
+cat unique_subs.txt | dnsgen - | massdns -r resolvers.txt -t A -o J --flush -w massdns_out.json
