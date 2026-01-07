@@ -23,14 +23,8 @@ subfinder -all -recursive -d $target -o $OUT_DIR/subfinder.txt
 assetfinder --subs-only $target > $OUT_DIR/assetfinder.txt
 
 # Github dorking
-# Check if token file exists to avoid errors
-if [ -f "$OUT_DIR/tokens.txt" ]; then
-    github-subdomains -d $target -t $OUT_DIR/tokens.txt -o $OUT_DIR/github_subs.txt
-else
-    echo "[-] tokens.txt not found in $OUT_DIR, skipping github-subdomains."
-    touch $OUT_DIR/github_subs.txt
-fi
-
+touch $OUT_DIR/github_subs.txt
+github-subdomains -d $target -t $gh_token -o $OUT_DIR/github_subs.txt
 # Merge Passive
 cat $OUT_DIR/amass.txt $OUT_DIR/subfinder.txt $OUT_DIR/assetfinder.txt $OUT_DIR/github_subs.txt 2>/dev/null | sort -u > $OUT_DIR/passive_subs.txt
 
