@@ -80,7 +80,7 @@ echo "[+] Extracting Params..."
 
 # 1. From Archives
 # Paramspider sometimes saves to ./results/, let's force output or move it
-paramspider -d $target --quiet 
+paramspider -d $target 
 # Paramspider usually saves to results/domain.txt. Let's move it if -o fails
 if [ -f "results/$target.txt" ]; then
     mv "results/$target.txt" "$OUT_DIR/paramspider.txt"
