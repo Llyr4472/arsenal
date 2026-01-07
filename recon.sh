@@ -1,52 +1,101 @@
 #!/bin/bash
-# Bug Bounty Automation Pipeline
-# Usage: ./recon.sh example.com
-domain=$1
-output_dir="recon_${domain}_$(date +%Y%m%d)"
-mkdir -p $output_dir
-echo "[*] Starting reconnaissance for $domain"
-# Step 1: Subdomain Enumeration
-echo "[*] Phase 1: Subdomain Discovery"
-subfinder -d $domain -all -silent -o $output_dir/subfinder.txt &
-amass enum -passive -d $domain -o $output_dir/amass.txt &
-assetfinder --subs-only $domain > $output_dir/assetfinder.txt &
-wait
-# Merge and deduplicate
-cat $output_dir/subfinder.txt $output_dir/amass.txt $output_dir/assetfinder.txt | sort -u > $output_dir/all_subdomains.txt
-echo "[+] Found $(wc -l < $output_dir/all_subdomains.txt) unique subdomains"
-# Step 2: Subdomain Permutation
-echo "[*] Phase 2: Generating permutations"
-cat $output_dir/all_subdomains.txt | dnsgen - | massdns -r resolvers.txt -t A -o J --flush 2>/dev/null | grep -oP '(?<=")[^"]+(?=")' | sort -u > $output_dir/resolved_subs.txt
-echo "[+] Resolved $(wc -l < $output_dir/resolved_subs.txt) subdomains"
-# Step 3: HTTP Probing
-echo "[*] Phase 3: Probing for live hosts"
-cat $output_dir/resolved_subs.txt | httpx -silent -title -status-code -tech-detect -o $output_dir/live_hosts.txt
-echo "[+] Found $(wc -l < $output_dir/live_hosts.txt) live hosts"
-# Step 4: URL Discovery
-echo "[*] Phase 4: URL and endpoint discovery"
-cat $output_dir/live_hosts.txt | awk '{print $1}' | waybackurls > $output_dir/wayback.txt
-cat $output_dir/live_hosts.txt | awk '{print $1}' | gau --blacklist png,jpg,gif,css > $output_dir/gau.txt
-cat $output_dir/live_hosts.txt | awk '{print $1}' | katana -d 3 -jc -o $output_dir/katana.txt
-# Merge all URLs
-cat $output_dir/wayback.txt $output_dir/gau.txt $output_dir/katana.txt | sort -u > $output_dir/all_urls.txt
-echo "[+] Collected $(wc -l < $output_dir/all_urls.txt) unique URLs"
-# Step 5: Vulnerability Scanning
-echo "[*] Phase 5: Vulnerability scanning"
-nuclei -l $output_dir/all_urls.txt -severity critical,high -o $output_dir/nuclei_findings.txt -silent
-# Check if any critical/high findings
-if [ -s $output_dir/nuclei_findings.txt ]; then
-    echo "[!] CRITICAL/HIGH vulnerabilities found!"
-    # Send notification
-    python3 notify.py --file $output_dir/nuclei_findings.txt --domain $domain
-else
-    echo "[*] No critical/high vulnerabilities found"
+# ==========================================
+#  Subdomain Enumeration and Recon Script
+#  Usage: ./recon.sh domain.com
+# ==========================================
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <target-domain>"
+    exit 1
 fi
-# Step 6: Generate report
-echo "[*] Generating summary report"
-echo "=== Reconnaissance Report for $domain ===" > $output_dir/report.txt
-echo "Date: $(date)" >> $output_dir/report.txt
-echo "Subdomains: $(wc -l < $output_dir/all_subdomains.txt)" >> $output_dir/report.txt
-echo "Live Hosts: $(wc -l < $output_dir/live_hosts.txt)" >> $output_dir/report.txt
-echo "URLs: $(wc -l < $output_dir/all_urls.txt)" >> $output_dir/report.txt
-echo "Findings: $(wc -l < $output_dir/nuclei_findings.txt)" >> $output_dir/report.txt
-echo "[+] Reconnaissance complete! Results in $output_dir/"
+
+target=$1
+# Fix: Use $HOME instead of ~ inside quotes
+OUT_DIR="$HOME/${target}"
+mkdir -p "$OUT_DIR"
+
+echo -e "\n[+] Saving output to: $OUT_DIR\n"
+
+# 1. Passive Enumeration
+echo "[+] Starting Passive Enum..."
+amass enum -passive -norecursive -d $target -o $OUT_DIR/amass.txt
+subfinder -all -recursive -d $target -o $OUT_DIR/subfinder.txt
+assetfinder --subs-only $target > $OUT_DIR/assetfinder.txt
+
+# Github dorking
+# Check if token file exists to avoid errors
+if [ -f "$OUT_DIR/tokens.txt" ]; then
+    github-subdomains -d $target -t $OUT_DIR/tokens.txt -o $OUT_DIR/github_subs.txt
+else
+    echo "[-] tokens.txt not found in $OUT_DIR, skipping github-subdomains."
+    touch $OUT_DIR/github_subs.txt
+fi
+
+# Merge Passive
+cat $OUT_DIR/amass.txt $OUT_DIR/subfinder.txt $OUT_DIR/assetfinder.txt $OUT_DIR/github_subs.txt 2>/dev/null | sort -u > $OUT_DIR/passive_subs.txt
+
+# 2. Active Bruteforce
+echo "[+] Starting Bruteforce..."
+# Ensure the wordlist exists, or default to a smaller one/skip
+WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+if [ -f "$WORDLIST" ]; then
+    dnsx -d $target -w $WORDLIST -silent -o $OUT_DIR/brute_subs.txt
+else
+    echo "[-] Wordlist not found at $WORDLIST. Skipping bruteforce."
+    touch $OUT_DIR/brute_subs.txt
+fi
+
+# 3. Permutations 
+echo "[+] Generating Permutations..."
+cat $OUT_DIR/passive_subs.txt $OUT_DIR/brute_subs.txt | sort -u > $OUT_DIR/all_subs_so_far.txt
+
+if [ -s "$OUT_DIR/all_subs_so_far.txt" ]; then
+    dnsgen $OUT_DIR/all_subs_so_far.txt | dnsx -silent -o $OUT_DIR/permutations.txt
+else
+    touch $OUT_DIR/permutations.txt
+fi
+
+# 4. Final DNS Resolution & Merging
+cat $OUT_DIR/passive_subs.txt $OUT_DIR/brute_subs.txt $OUT_DIR/permutations.txt | sort -u | dnsx -silent > $OUT_DIR/final_resolvable_subdomains.txt
+
+echo "[+] Probing HTTP/S on standard and non-standard ports..."
+
+# Option A: Fast (80, 443, 8000, 8080, 8443)
+httpx -l $OUT_DIR/final_resolvable_subdomains.txt -ports 80,443,8000,8080,8443 -title -tech-detect -status-code -ip -silent -o $OUT_DIR/alive.txt
+
+# --- Step 3: Endpoint Discovery ---
+
+# Clean the list to just URLs for the tools
+awk '{print $1}' $OUT_DIR/alive.txt > $OUT_DIR/alive_urls_only.txt
+
+echo "[+] Mining Archives..."
+# Note: Waymore requires config setup usually, ensure it's working
+waymore -i $target -mode U -oU $OUT_DIR/waymore_urls.txt
+
+echo "[+] Crawling..."
+katana -list $OUT_DIR/alive_urls_only.txt -jc -d 2 -rl 5 -timeout 10 -silent -o $OUT_DIR/katana.txt
+
+echo "[+] Merging & Cleaning..."
+# Fix: Handle cases where files might be empty
+cat $OUT_DIR/waymore_urls.txt $OUT_DIR/katana.txt 2>/dev/null | uro | sort -u > $OUT_DIR/clean_urls.txt
+
+
+# --- Step 4: Parameter Discovery ---
+
+echo "[+] Extracting Params..."
+
+# 1. From Archives
+# Paramspider sometimes saves to ./results/, let's force output or move it
+paramspider -d $target --quiet 
+# Paramspider usually saves to results/domain.txt. Let's move it if -o fails
+if [ -f "results/$target.txt" ]; then
+    mv "results/$target.txt" "$OUT_DIR/paramspider.txt"
+fi
+
+# 2. Extract from crawled URLs
+grep "?" $OUT_DIR/clean_urls.txt > $OUT_DIR/crawled_params.txt
+
+# 3. Merge
+cat $OUT_DIR/paramspider.txt $OUT_DIR/crawled_params.txt 2>/dev/null | uro | sort -u > $OUT_DIR/final_params.txt
+
+echo "[+] Recon Complete. All data saved in $OUT_DIR"
