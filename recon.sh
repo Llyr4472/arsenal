@@ -211,17 +211,11 @@ if [ "$START_PHASE" -le 5 ]; then
     echo "    Probing $TOTAL_TO_PROBE subdomains for HTTP/HTTPS..."
 
     # Check for HTTP/HTTPS with progress
-    if command -v pv &> /dev/null; then
-        pv -N "Probing" -l $OUT_DIR/final_subdomains.txt | httpx \
-            -ports 80,443,8080,8443 \
-            -title -tech-detect -status-code -ip -silent \
-            -o $OUT_DIR/alive.txt > /dev/null 2>&1
-    else
         httpx -l $OUT_DIR/final_subdomains.txt \
             -ports 80,443,8080,8443 \
             -title -tech-detect -status-code -ip -silent \
-            -o $OUT_DIR/alive.txt > /dev/null 2>&1
-    fi
+            -o $OUT_DIR/alive.txt \
+            -silent
 
     if [ -f "$OUT_DIR/alive.txt" ]; then
         HTTP_COUNT=$(wc -l < $OUT_DIR/alive.txt)
