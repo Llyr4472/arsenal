@@ -91,7 +91,7 @@ if [ "$START_PHASE" -le 1 ]; then
 
     echo "    -> Running Amass (Passive)..."
     # Amass often times out or fails, we allow it but don't depend on it
-    amass enum -passive -norecursive -d $target -o $OUT_DIR/amass.txt -silent 
+    # amass enum -passive -norecursive -d $target -o $OUT_DIR/amass.txt -silent 
     echo -e "${GREEN}[+] Enumerated [$(wc -l < $OUT_DIR/amass.txt)] subdomains.${RESET}"
 else
     echo -e "${YELLOW}[+] Phase 1: Passive Enumeration (Skipped)${RESET}"
@@ -108,10 +108,10 @@ if [ "$START_PHASE" -le 1 ]; then
     # Merge all passive sources
     # 2>/dev/null suppresses "No such file" errors if a tool failed
     cat $OUT_DIR/subfinder.txt $OUT_DIR/assetfinder.txt $OUT_DIR/amass.txt $OUT_DIR/github_subs.txt | sort -u > $OUT_DIR/passive_raw.txt
-fi
 
-PASSIVE_COUNT=$(wc -l < $OUT_DIR/passive_raw.txt)
-echo -e "${GREEN}[+] Passive Subdomains Found: $PASSIVE_COUNT${RESET}"
+    PASSIVE_COUNT=$(wc -l < $OUT_DIR/passive_raw.txt)
+    echo -e "${GREEN}[+] Passive Subdomains Found: $PASSIVE_COUNT${RESET}"
+fi
 
 #==========================================
 # PHASE 2: Active Bruteforce (Puredns)
@@ -208,21 +208,28 @@ if [ "$START_PHASE" -le 5 ]; then
     # Merge Base Alive + Permutations Alive
     cat $OUT_DIR/base_resolved.txt $OUT_DIR/permutations_resolved.txt  | sort -u > $OUT_DIR/final_subdomains.txt
     TOTAL_TO_PROBE=$(wc -l < $OUT_DIR/final_subdomains.txt)
-    echo "    Probing $TOTAL_TO_PROBE subdomains for HTTP/HTTPS..."
+    echo "    Probing $TOTAL_TO_PROBE subdomains for open ports..."
 
-    # Check for HTTP/HTTPS with progress
-        httpx -l $OUT_DIR/final_subdomains.txt \
-            -ports 80,443,8080,8443 \
-            -title -tech-detect -status-code -ip -silent \
-            -o $OUT_DIR/alive.txt \
-            -silent
+    # Port scan all subdomains to find open ports (Silent)
+    naabu -list $OUT_DIR/final_subdomains.txt -p - -silent -o $OUT_DIR/alive.txt
 
     if [ -f "$OUT_DIR/alive.txt" ]; then
-        HTTP_COUNT=$(wc -l < $OUT_DIR/alive.txt)
+        ALIVE_COUNT=$(wc -l < $OUT_DIR/alive.txt)
+    else
+        ALIVE_COUNT=0
+    fi
+    echo -e "    Probing $ALIVE_COUNT alive subdomains for HTTP/HTTPS..."
+    # Check for HTTP/HTTPS with progress
+    httpx -l $OUT_DIR/alive.txt \
+        -title -tech-detect -status-code -ip -silent \
+        -o $OUT_DIR/web_alive.txt
+
+    if [ -f "$OUT_DIR/web_alive.txt" ]; then
+        HTTP_COUNT=$(wc -l < $OUT_DIR/web_alive.txt)
     else
         HTTP_COUNT=0
     fi
-    echo -e "${GREEN}[+] Alive Web Servers: $HTTP_COUNT / $TOTAL_TO_PROBE${RESET}"
+    echo -e "${GREEN}[+] Alive Web Servers Found: $HTTP_COUNT / $ALIVE_COUNT${RESET}"
 else
     echo -e "${YELLOW}[+] Phase 5: Final HTTP Probing (Skipped)${RESET}"
     # Load existing count for subsequent phases
