@@ -212,7 +212,7 @@ if [ "$START_PHASE" -le 5 ]; then
     echo "    Probing $TOTAL_TO_PROBE subdomains for HTTP/HTTPS..."
 
     # Port scan all subdomains to find open ports (Silent)
-    naabu -list $OUT_DIR/final_subdomains.txt -tp 1000 -o $OUT_DIR/alive.txt
+    naabu -list $OUT_DIR/final_subdomains.txt -tp 1000 -silent -o $OUT_DIR/alive.txt
 
     if [ -f "$OUT_DIR/alive.txt" ]; then
         ALIVE_COUNT=$(wc -l < $OUT_DIR/alive.txt)
