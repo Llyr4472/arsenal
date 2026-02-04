@@ -52,7 +52,7 @@ show_progress() {
 
 target=$1
 # Use $HOME to be safe with paths
-OUT_DIR="$HOME/${target}"
+OUT_DIR="$HOME/bb/${target}"
 mkdir -p "$OUT_DIR"
 
 # 2. Colors & Vars
@@ -91,7 +91,7 @@ if [ "$START_PHASE" -le 1 ]; then
 
     echo "    -> Running Amass (Passive)..."
     # Amass often times out or fails, we allow it but don't depend on it
-    # amass enum -passive -norecursive -d $target -o $OUT_DIR/amass.txt -silent
+    # amass enum -passive -norecursive -d $target -o $OUT_DIR/amass.txt -silent 
     echo -e "${GREEN}[+] Enumerated [$(wc -l < $OUT_DIR/amass.txt)] subdomains.${RESET}"
 else
     echo -e "${YELLOW}[+] Phase 1: Passive Enumeration (Skipped)${RESET}"
@@ -212,7 +212,7 @@ if [ "$START_PHASE" -le 5 ]; then
     echo "    Probing $TOTAL_TO_PROBE subdomains for HTTP/HTTPS..."
 
     # Port scan all subdomains to find open ports (Silent)
-    naabu -list $OUT_DIR/final_subdomains.txt -tp 1000 -silent -o $OUT_DIR/alive.txt
+    naabu -list $OUT_DIR/final_subdomains.txt -tp 1000 -o $OUT_DIR/alive.txt
 
     if [ -f "$OUT_DIR/alive.txt" ]; then
         ALIVE_COUNT=$(wc -l < $OUT_DIR/alive.txt)

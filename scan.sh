@@ -17,7 +17,7 @@ invasive=false  # Set to true to enable XSS scanning
 
 # --- Output Setup ---
 # Fix: Use $HOME instead of ~
-OUT_DIR="$HOME/${target}"
+OUT_DIR="$HOME/bb/${target}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -38,7 +38,7 @@ if [ -f "$OUT_DIR/alive.txt" ]; then
         -tags cve,osint,tech \
         -et dos,fuzzing \
         -severity low,medium,high,critical \
-        -o "$OUT_DIR/nuclei_vulns.txt"
+        -o "$OUT_DIR/nuclei_vulns.txt" -t ~/nuclei-templates/
         
     echo -e "${GREEN}[+] Nuclei scan complete. Results: $OUT_DIR/nuclei_vulns.txt${RESET}"
 else
@@ -58,7 +58,7 @@ if [ -f "$OUT_DIR/clean_urls.txt" ]; then
         nuclei -l "$OUT_DIR/js_files_url.txt" -t http/exposures -o "$OUT_DIR/js_secrets.txt"
         
         echo -e "${YELLOW}    -> Mining JS for hidden endpoints...${RESET}"
-        cat "$OUT_DIR/js_files_url.txt" | mantra -o "$OUT_DIR/js_hidden_endpoints.txt"
+        cat "$OUT_DIR/js_files_url.txt" | mantra > "$OUT_DIR/js_hidden_endpoints.txt"
     else
         echo -e "${RED}[!] No JS files found in clean_urls.txt.${RESET}"
     fi
