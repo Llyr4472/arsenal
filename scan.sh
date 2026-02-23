@@ -246,7 +246,6 @@ if [ "$SKIP_NUCLEI" = false ]; then
                -tags cve,osint,tech,exposure,misconfig,default-login \
                -et dos,fuzzing,headless \
                -severity "$SEVERITY" \
-               -c "$THREADS" \
                -rate-limit "$RATE" \
                -silent \
                -o "$VULN_DIR/nuclei_vulns.txt" \
