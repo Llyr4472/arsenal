@@ -256,7 +256,6 @@ if [ "$SKIP_NUCLEI" = false ]; then
         nuclei -l "$VULN_DIR/nuclei_targets.txt" \
                -tags exposure,token,secret,api-key \
                -silent \
-               -c "$THREADS" \
                -rate-limit "$RATE" \
                -o "$VULN_DIR/nuclei_exposures.txt" \
                -t "$NUCLEI_TEMPLATES/" 2>/dev/null
@@ -267,7 +266,6 @@ if [ "$SKIP_NUCLEI" = false ]; then
             nuclei -l "$OUT_DIR/final_subdomains.txt" \
                    -tags takeover \
                    -silent \
-                   -c "$THREADS" \
                    -rate-limit "$RATE" \
                    -o "$VULN_DIR/nuclei_takeovers.txt" \
                    -t "$NUCLEI_TEMPLATES/" 2>/dev/null
@@ -312,7 +310,6 @@ if [ "$SKIP_JS" = false ]; then
                        -t "$NUCLEI_TEMPLATES/http/exposures/" \
                        -tags token,secret,api-key,exposure \
                        -silent \
-                       -c "$THREADS" \
                        -o "$VULN_DIR/js_secrets.txt" 2>/dev/null
                 JS_SECRET_COUNT=$(count_lines "$VULN_DIR/js_secrets.txt")
                 [ "$JS_SECRET_COUNT" -gt 0 ] && log_finding "HIGH" "JS Secrets found: $JS_SECRET_COUNT"
@@ -495,7 +492,6 @@ if require_tool corsy || require_tool nuclei; then
             nuclei -l "$OUT_DIR/alive_urls_only.txt" \
                    -tags cors \
                    -silent \
-                   -c "$THREADS" \
                    -o "$VULN_DIR/cors_findings.txt" \
                    -t "$NUCLEI_TEMPLATES/" 2>/dev/null
             CORS_COUNT=$(count_lines "$VULN_DIR/cors_findings.txt")
@@ -519,7 +515,6 @@ if require_file "$OUT_DIR/alive_urls_only.txt"; then
         nuclei -l "$OUT_DIR/alive_urls_only.txt" \
                -tags headers,ssl,tls,misconfiguration \
                -silent \
-               -c "$THREADS" \
                -rate-limit "$RATE" \
                -o "$VULN_DIR/headers_ssl_findings.txt" \
                -t "$NUCLEI_TEMPLATES/" 2>/dev/null
@@ -550,7 +545,6 @@ if require_file "$VULN_DIR/potential_redirect.txt"; then
         nuclei -l "$VULN_DIR/potential_redirect.txt" \
                -tags redirect \
                -silent \
-               -c "$THREADS" \
                -o "$VULN_DIR/confirmed_redirects.txt" \
                -t "$NUCLEI_TEMPLATES/" 2>/dev/null
         CONFIRMED=$(count_lines "$VULN_DIR/confirmed_redirects.txt")
@@ -649,7 +643,6 @@ if require_file "$VULN_DIR/potential_ssrf.txt"; then
         nuclei -l "$VULN_DIR/potential_ssrf.txt" \
                -tags ssrf \
                -silent \
-               -c "$THREADS" \
                -o "$VULN_DIR/confirmed_ssrf.txt" \
                -t "$NUCLEI_TEMPLATES/" 2>/dev/null
         SSRF_CONFIRMED=$(count_lines "$VULN_DIR/confirmed_ssrf.txt")
@@ -704,7 +697,6 @@ if require_tool nuclei && require_file "$OUT_DIR/alive_urls_only.txt"; then
         nuclei -l "$VULN_DIR/403_pages.txt" \
                -tags bypass,403 \
                -silent \
-               -c "$THREADS" \
                -o "$VULN_DIR/403_bypass.txt" \
                -t "$NUCLEI_TEMPLATES/" 2>/dev/null
         BYPASS_COUNT=$(count_lines "$VULN_DIR/403_bypass.txt")
