@@ -1,443 +1,331 @@
 #!/bin/bash
-# ==========================================
-#  Vulnerability Scanner Automation v3.0
-#  Features: Resume, Auto-pause, Detachable
+# ══════════════════════════════════════════════════════════════
+#  scan.sh v4.0 — Vulnerability Scanner | Resume | bbq-managed
+#
+#  All tool output goes to per-tool log files under $OUT_DIR/logs/
+#  Main scan.log gets timestamped step progress + counts only.
+#  Use --redo <step> to re-run specific steps without --fresh.
+#
 #  Requires: recon.sh to have been run first
 #  Usage: ./scan.sh <domain> [options]
-#  Managed by: scan_manager.sh
-# ==========================================
+# ══════════════════════════════════════════════════════════════
 
-# ==========================================
-# COLORS & FORMATTING
-# ==========================================
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-RESET='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+BLUE='\033[0;34m';  CYAN='\033[0;36m';   MAGENTA='\033[0;35m'
+BOLD='\033[1m';     DIM='\033[2m';       RESET='\033[0m'
 
-# ==========================================
-# BANNER
-# ==========================================
-print_banner() {
-    echo -e "${RED}${BOLD}"
-    echo "  ██╗   ██╗██╗   ██╗██╗     ███╗   ██╗"
-    echo "  ██║   ██║██║   ██║██║     ████╗  ██║"
-    echo "  ██║   ██║██║   ██║██║     ██╔██╗ ██║"
-    echo "  ╚██╗ ██╔╝██║   ██║██║     ██║╚██╗██║"
-    echo "   ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║"
-    echo "    ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝  Scanner v3.0"
-    echo -e "${RESET}"
-}
-
-# ==========================================
-# HELPERS
-# ==========================================
-log_info()    { echo -e "[$(date '+%H:%M:%S')] ${BLUE}[*]${RESET} $1"; }
-log_success() { echo -e "[$(date '+%H:%M:%S')] ${GREEN}[+]${RESET} $1"; }
-log_warn()    { echo -e "[$(date '+%H:%M:%S')] ${YELLOW}[!]${RESET} $1"; }
-log_error()   { echo -e "[$(date '+%H:%M:%S')] ${RED}[✗]${RESET} $1"; }
-log_phase()   {
-    echo -e "\n${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${RED}${BOLD}  $1${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-}
+# ── Logging ───────────────────────────────────────────────────
+TS()          { date '+%Y-%m-%d %H:%M:%S'; }
+log_info()    { echo -e "[$(TS)] ${BLUE}[*]${RESET} $1";  echo "[$(TS)] [INFO]  $1" >> "$LOG_FILE"; }
+log_ok()      { echo -e "[$(TS)] ${GREEN}[+]${RESET} $1"; echo "[$(TS)] [OK]    $1" >> "$LOG_FILE"; }
+log_warn()    { echo -e "[$(TS)] ${YELLOW}[!]${RESET} $1"; echo "[$(TS)] [WARN]  $1" >> "$LOG_FILE"; }
+log_error()   { echo -e "[$(TS)] ${RED}[x]${RESET} $1";  echo "[$(TS)] [ERROR] $1" >> "$LOG_FILE"; }
 log_finding() {
-    local severity="$1"
-    local msg="$2"
-    case "$severity" in
-        CRITICAL) echo -e "[$(date '+%H:%M:%S')] ${RED}${BOLD}  [CRITICAL]${RESET} $msg" ;;
-        HIGH)     echo -e "[$(date '+%H:%M:%S')] ${RED}  [HIGH]${RESET} $msg" ;;
-        MEDIUM)   echo -e "[$(date '+%H:%M:%S')] ${YELLOW}  [MEDIUM]${RESET} $msg" ;;
-        LOW)      echo -e "[$(date '+%H:%M:%S')] ${BLUE}  [LOW]${RESET} $msg" ;;
-        INFO)     echo -e "[$(date '+%H:%M:%S')] ${CYAN}  [INFO]${RESET} $msg" ;;
+    local sev="$1" msg="$2"
+    case "$sev" in
+        CRITICAL) echo -e "[$(TS)] ${RED}${BOLD}[CRITICAL]${RESET} $msg" ;;
+        HIGH)     echo -e "[$(TS)] ${RED}[HIGH]${RESET} $msg" ;;
+        MEDIUM)   echo -e "[$(TS)] ${YELLOW}[MEDIUM]${RESET} $msg" ;;
+        LOW)      echo -e "[$(TS)] ${BLUE}[LOW]${RESET} $msg" ;;
+        INFO)     echo -e "[$(TS)] ${CYAN}[INFO]${RESET} $msg" ;;
     esac
+    echo "[$(TS)] [FINDING/$sev] $msg" >> "$LOG_FILE"
+}
+log_phase() {
+    local msg="$1"
+    echo -e "\n${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}  $msg${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo "[$(TS)] [PHASE] === $msg ===" >> "$LOG_FILE"
 }
 
-count_lines() {
-    [ -f "$1" ] && wc -l < "$1" || echo 0
+# Run a tool, capturing ALL stdout+stderr to a dedicated log file.
+# Writes start/end markers so you can see exactly what happened.
+# Usage: run_tool <logname> <description> <cmd> [args...]
+run_tool() {
+    local logname="$1" desc="$2"
+    shift 2
+    local toollog="$LOGS_DIR/${logname}.log"
+    echo "[$(TS)] [START] $desc" >> "$LOG_FILE"
+    echo "[$(TS)] [CMD]   $*"    >> "$LOG_FILE"
+    echo "[$(TS)] [LOG]   $toollog" >> "$LOG_FILE"
+    {
+        echo "=== START: $desc ==="
+        echo "=== CMD:   $*"
+        echo "=== TIME:  $(TS)"
+        echo ""
+        "$@"
+        local ec=$?
+        echo ""
+        echo "=== END: exit=$ec time=$(TS) ==="
+        return $ec
+    } >> "$toollog" 2>&1
+    local ec=$?
+    echo "[$(TS)] [DONE]  $desc (exit=$ec)" >> "$LOG_FILE"
+    return $ec
 }
 
-safe_touch() {
-    for f in "$@"; do [ -f "$f" ] || touch "$f"; done
-}
+count_lines()  { [ -f "$1" ] && wc -l < "$1" || echo 0; }
+safe_touch()   { for f in "$@"; do [ -f "$f" ] || touch "$f"; done; }
 
 require_tool() {
-    if ! command -v "$1" &>/dev/null; then
-        log_warn "Tool not found: ${BOLD}$1${RESET} — skipping related step."
-        return 1
-    fi
-    return 0
+    command -v "$1" &>/dev/null && return 0
+    log_warn "Tool not found: ${BOLD}$1${RESET} — skipping."
+    return 1
 }
 
 require_file() {
-    if [ ! -f "$1" ] || [ ! -s "$1" ]; then
-        log_warn "Required file missing or empty: ${BOLD}$1${RESET} — skipping step."
-        return 1
-    fi
-    return 0
+    [ -f "$1" ] && [ -s "$1" ] && return 0
+    log_warn "Missing/empty: ${BOLD}$1${RESET} — skipping."
+    return 1
 }
 
-report_finding() {
-    local section="$1"
-    local severity="$2"
-    local tool="$3"
-    local detail="$4"
-    echo "| $section | $severity | $tool | $detail |" >> "$REPORT_MD"
-}
-
-# ==========================================
-# RESUME / STEP STATE TRACKING
-# ==========================================
-# Each completed step name is written to STEP_STATE_FILE.
-# On re-run, completed steps are skipped automatically.
-
-step_done() {
-    grep -qxF "$1" "$STEP_STATE_FILE" 2>/dev/null
-}
-
+step_done()      { grep -qxF "$1" "$STEP_STATE_FILE" 2>/dev/null; }
 mark_step_done() {
     echo "$1" >> "$STEP_STATE_FILE"
-    log_info "Step '${BOLD}$1${RESET}' marked complete."
+    log_ok "Step '${BOLD}$1${RESET}' marked complete."
 }
 
-# ==========================================
-# NETWORK WATCHDOG
-# ==========================================
-# Spawns a background loop that monitors connectivity.
-# On 3 consecutive ping failures → creates PAUSE_FILE.
-# When connectivity restored → removes PAUSE_FILE.
-# All steps call wait_if_paused() before executing.
-
-PAUSE_FILE=""   # set after OUT_DIR is known
-WATCHDOG_PID=""
-
-start_network_watchdog() {
-    (
-        local fail_count=0
-        local check_host="8.8.8.8"
-        local paused=false
-
-        while true; do
-            if ping -c 1 -W 3 "$check_host" &>/dev/null 2>&1; then
-                fail_count=0
-                if $paused; then
-                    rm -f "$PAUSE_FILE"
-                    paused=false
-                    echo "[$(date '+%H:%M:%S')] [WATCHDOG] Network restored — scan will resume." \
-                        >> "${PAUSE_FILE%/*}/watchdog.log"
-                fi
-            else
-                ((fail_count++))
-                echo "[$(date '+%H:%M:%S')] [WATCHDOG] Ping failed ($fail_count/3)" \
-                    >> "${PAUSE_FILE%/*}/watchdog.log"
-                if [ "$fail_count" -ge 3 ] && ! $paused; then
-                    touch "$PAUSE_FILE"
-                    paused=true
-                    echo "[$(date '+%H:%M:%S')] [WATCHDOG] Network lost — scan paused." \
-                        >> "${PAUSE_FILE%/*}/watchdog.log"
-                fi
-            fi
-            sleep 10
-        done
-    ) &
-    WATCHDOG_PID=$!
-    echo "$WATCHDOG_PID" > "$OUT_DIR/.watchdog_pid"
-    log_info "Network watchdog started (PID: $WATCHDOG_PID)"
-}
-
-stop_network_watchdog() {
-    if [ -n "$WATCHDOG_PID" ] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
-        kill "$WATCHDOG_PID" 2>/dev/null
-        rm -f "$OUT_DIR/.watchdog_pid"
+force_redo_step() {
+    local step="$1"
+    if grep -qxF "$step" "$STEP_STATE_FILE" 2>/dev/null; then
+        grep -v "^${step}$" "$STEP_STATE_FILE" > "${STEP_STATE_FILE}.tmp" \
+            && mv "${STEP_STATE_FILE}.tmp" "$STEP_STATE_FILE"
+        log_warn "Cleared checkpoint for step: $step — will re-run"
     fi
 }
 
+# ── Pause ─────────────────────────────────────────────────────
 wait_if_paused() {
-    if [ ! -f "$PAUSE_FILE" ]; then return 0; fi
-
-    log_warn "Scan PAUSED (network/manual pause). Waiting to resume..."
-    log_warn "To manually resume: rm '$PAUSE_FILE'"
-
-    while [ -f "$PAUSE_FILE" ]; do
-        sleep 15
-    done
-
-    log_success "Scan RESUMED — continuing from last checkpoint."
+    [ ! -f "$PAUSE_FILE" ] && return 0
+    log_warn "Scan PAUSED — waiting to resume..."
+    while [ -f "$PAUSE_FILE" ]; do sleep 15; done
+    log_ok "Scan RESUMED."
 }
 
-# ==========================================
-# GRACEFUL SHUTDOWN HANDLER
-# ==========================================
+# ── Cleanup ───────────────────────────────────────────────────
 cleanup_on_exit() {
-    local exit_code=$?
-    stop_network_watchdog
-    rm -f "$OUT_DIR/.scan_pid"
-
-    if [ "$exit_code" -eq 0 ]; then
-        echo "done" > "$OUT_DIR/.scan_status"
-        log_success "Scan finished cleanly."
+    local code=$?
+    rm -f "$OUT_DIR/.scan_pid" "$OUT_DIR/.scan_pgid"
+    if [ "$code" -eq 0 ]; then
+        echo "done"        > "$OUT_DIR/.scan_status"
+        log_ok "Scan finished cleanly."
     else
         echo "interrupted" > "$OUT_DIR/.scan_status"
-        log_warn "Scan interrupted (exit $exit_code). Re-run to resume from last checkpoint."
+        log_warn "Scan interrupted (exit $code) — re-run to resume from checkpoint."
     fi
 }
-
 trap cleanup_on_exit EXIT
-trap 'log_warn "Received SIGTERM — stopping scan."; exit 130' TERM
-trap 'log_warn "Received SIGINT — stopping scan."; exit 130' INT
+trap 'exit 130' TERM INT
 
-# ==========================================
-# USAGE
-# ==========================================
+# ── Usage ─────────────────────────────────────────────────────
 usage() {
     echo -e "${BOLD}Usage:${RESET} $0 <target-domain> [options]"
     echo ""
-    echo -e "${BOLD}Options:${RESET}"
-    echo "  --invasive              Enable active/invasive scans (XSS, SQLi fuzz)"
+    echo "  --invasive              Enable active scans (XSS, SQLi)"
     echo "  --threads <n>           Thread count (default: 50)"
-    echo "  --rate <n>              Rate limit for ffuf/nuclei (default: 50)"
-    echo "  --severity <s>          Nuclei severity filter (default: low,medium,high,critical)"
+    echo "  --rate <n>              Rate limit for nuclei/ffuf (default: 50)"
+    echo "  --severity <s>          Nuclei severity (default: low,medium,high,critical)"
     echo "  --nuclei-templates <p>  Path to nuclei templates (default: ~/nuclei-templates)"
+    echo "  --nuclei-timeout <n>    Per-host nuclei timeout seconds (default: 30)"
+    echo "  --fresh                 Wipe ALL scan state and restart"
+    echo "  --redo <step>           Re-run one step, keep all others"
+    echo "                          Steps: nuclei  js  ffuf  gf  cors"
+    echo "                                 headers  redirect  ssrf  lfi  bypass"
+    echo "                                 sqli  xss  (sqli/xss require --invasive)"
     echo "  --skip-nuclei           Skip nuclei scan"
     echo "  --skip-js               Skip JS analysis"
     echo "  --skip-ffuf             Skip directory fuzzing"
     echo "  --skip-gf               Skip GF pattern filtering"
-    echo "  --fresh                 Ignore saved state and restart from scratch"
     echo ""
-    echo -e "${BOLD}Resume:${RESET}"
-    echo "  Simply re-run the same command — completed steps are skipped automatically."
-    echo "  Use --fresh to force a full restart."
-    echo ""
-    echo -e "${BOLD}Examples:${RESET}"
-    echo "  $0 example.com"
-    echo "  $0 example.com --invasive --threads 100"
-    echo "  $0 example.com --fresh"
+    echo "Resume: just re-run — completed steps are skipped automatically."
     exit 1
 }
 
-# ==========================================
-# ARG PARSING
-# ==========================================
-if [ "$#" -lt 1 ]; then
-    print_banner
-    usage
-fi
-
-target="$1"
-shift
+# ── Arg Parsing ───────────────────────────────────────────────
+[ "$#" -lt 1 ] && { usage; }
+TARGET="$1"; shift
 
 INVASIVE=false
 THREADS=50
 RATE=50
 SEVERITY="low,medium,high,critical"
 NUCLEI_TEMPLATES="$HOME/nuclei-templates"
+NUCLEI_TIMEOUT=30
 SKIP_NUCLEI=false
 SKIP_JS=false
 SKIP_FFUF=false
 SKIP_GF=false
 FRESH_START=false
+REDO_STEPS=()
 FFUF_WORDLIST="/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --invasive)           INVASIVE=true; shift ;;
-        --threads)            THREADS="$2"; shift 2 ;;
-        --rate)               RATE="$2"; shift 2 ;;
-        --severity)           SEVERITY="$2"; shift 2 ;;
-        --nuclei-templates)   NUCLEI_TEMPLATES="$2"; shift 2 ;;
-        --skip-nuclei)        SKIP_NUCLEI=true; shift ;;
-        --skip-js)            SKIP_JS=true; shift ;;
-        --skip-ffuf)          SKIP_FFUF=true; shift ;;
-        --skip-gf)            SKIP_GF=true; shift ;;
-        --fresh)              FRESH_START=true; shift ;;
+        --invasive)           INVASIVE=true;            shift   ;;
+        --threads)            THREADS="$2";             shift 2 ;;
+        --rate)               RATE="$2";                shift 2 ;;
+        --severity)           SEVERITY="$2";            shift 2 ;;
+        --nuclei-templates)   NUCLEI_TEMPLATES="$2";    shift 2 ;;
+        --nuclei-timeout)     NUCLEI_TIMEOUT="$2";      shift 2 ;;
+        --skip-nuclei)        SKIP_NUCLEI=true;         shift   ;;
+        --skip-js)            SKIP_JS=true;             shift   ;;
+        --skip-ffuf)          SKIP_FFUF=true;           shift   ;;
+        --skip-gf)            SKIP_GF=true;             shift   ;;
+        --fresh)              FRESH_START=true;         shift   ;;
+        --redo)               REDO_STEPS+=("$2");       shift 2 ;;
         -h|--help)            usage ;;
-        *) log_error "Unknown option: $1"; usage ;;
+        *) echo "Unknown option: $1"; usage ;;
     esac
 done
 
-# ==========================================
-# SETUP
-# ==========================================
-OUT_DIR="$HOME/bb/${target}"
+# ── Setup (must happen before any logging) ────────────────────
+OUT_DIR="$HOME/bb/$TARGET"
 VULN_DIR="$OUT_DIR/vulns"
 REPORT_DIR="$OUT_DIR/report"
-LOG_FILE="$OUT_DIR/vuln_scan.log"
+LOGS_DIR="$OUT_DIR/logs"
+LOG_FILE="$LOGS_DIR/scan.log"
 STEP_STATE_FILE="$OUT_DIR/.scan_steps"
 PAUSE_FILE="$OUT_DIR/.paused"
 
-mkdir -p "$VULN_DIR" "$REPORT_DIR"
+[ ! -d "$OUT_DIR" ] && {
+    echo "[ERROR] Recon output not found: $OUT_DIR"
+    echo "[ERROR] Run recon.sh first: ./recon.sh $TARGET"
+    exit 1
+}
 
-# Write PID so manager can track/kill us
-echo $$ > "$OUT_DIR/.scan_pid"
+mkdir -p "$VULN_DIR" "$REPORT_DIR" "$LOGS_DIR"
+
+# Write PID and PGID for bbq tracking
+echo $$       > "$OUT_DIR/.scan_pid"
+ps -o pgid= -p $$ | tr -d ' ' > "$OUT_DIR/.scan_pgid"
 echo "running" > "$OUT_DIR/.scan_status"
 
-# Redirect all output to log file AND stdout (so manager can tail -f)
-exec > >(tee -a "$LOG_FILE") 2>&1
-
-# ==========================================
-# RESUME / FRESH START LOGIC
-# ==========================================
+# Fresh log on fresh start, append on resume
 if [ "$FRESH_START" = "true" ]; then
-    log_warn "Fresh start requested — clearing previous scan state."
+    > "$LOG_FILE"
+fi
+
+# Log header
+echo "" >> "$LOG_FILE"
+echo "[$(TS)] ============================================" >> "$LOG_FILE"
+echo "[$(TS)] [START] scan.sh $TARGET  pid=$$" >> "$LOG_FILE"
+echo "[$(TS)] [ARGS]  threads=$THREADS rate=$RATE severity=$SEVERITY invasive=$INVASIVE fresh=$FRESH_START" >> "$LOG_FILE"
+echo "[$(TS)] ============================================" >> "$LOG_FILE"
+
+# ── Fresh Start / Resume ──────────────────────────────────────
+if [ "$FRESH_START" = "true" ]; then
+    log_warn "Fresh start — clearing previous scan state."
     rm -f "$STEP_STATE_FILE"
     rm -f "$VULN_DIR"/*.txt "$VULN_DIR"/*.json "$VULN_DIR"/*.html 2>/dev/null
+    rm -f "$LOGS_DIR"/*.log 2>/dev/null
 fi
+
+# ── Redo specific steps ───────────────────────────────────────
+for step in "${REDO_STEPS[@]}"; do
+    case "$step" in
+        nuclei)   force_redo_step "nuclei_main" ;;
+        js)       force_redo_step "js_analysis" ;;
+        ffuf)     force_redo_step "ffuf_fuzz" ;;
+        gf)       force_redo_step "gf_patterns" ;;
+        cors)     force_redo_step "cors_check" ;;
+        headers)  force_redo_step "headers_ssl" ;;
+        redirect) force_redo_step "open_redirect" ;;
+        ssrf)     force_redo_step "ssrf_test" ;;
+        lfi)      force_redo_step "lfi_test" ;;
+        bypass)   force_redo_step "403_bypass" ;;
+        sqli)     force_redo_step "sqli_sqlmap" ;;
+        xss)      force_redo_step "xss_dalfox" ;;
+        *) log_warn "Unknown step name for --redo: $step" ;;
+    esac
+done
 
 IS_RESUME=false
 if [ -f "$STEP_STATE_FILE" ] && [ -s "$STEP_STATE_FILE" ]; then
     IS_RESUME=true
-    COMPLETED=$(wc -l < "$STEP_STATE_FILE")
-    log_warn "Resuming scan — ${BOLD}$COMPLETED${RESET} steps already completed."
+    log_warn "Resuming — $(wc -l < "$STEP_STATE_FILE") steps already done."
 fi
 
-# ==========================================
-# VERIFY RECON OUTPUT EXISTS
-# ==========================================
-if [ ! -d "$OUT_DIR" ]; then
-    log_error "Recon output directory not found: $OUT_DIR"
-    log_error "Please run recon.sh first: ./recon.sh $target"
-    exit 1
-fi
-
-# ==========================================
-# INIT REPORT (only on fresh start)
-# ==========================================
-REPORT_MD="$REPORT_DIR/report.md"
-REPORT_HTML="$REPORT_DIR/report.html"
-SCAN_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 START_TIME=$(date +%s)
 
-init_report() {
-    # Don't overwrite if resuming
-    if [ -f "$REPORT_MD" ] && [ "$IS_RESUME" = "true" ]; then
-        log_info "Keeping existing report (resume mode)."
-        return
-    fi
-    cat > "$REPORT_MD" <<EOF
-# Vulnerability Scan Report
-**Target:** \`$target\`
-**Date:** $SCAN_DATE
-**Mode:** $([ "$INVASIVE" = "true" ] && echo "Invasive (Active)" || echo "Passive")
-
----
-
-## Summary
-
-| Category | Count |
-|----------|-------|
-| Nuclei Findings | - |
-| JS Secrets | - |
-| Potential SSRF | - |
-| Potential SQLi | - |
-| Potential LFI | - |
-| Potential RCE | - |
-| Open Redirects | - |
-| XSS (Dalfox) | - |
-| FFUF Findings | - |
-
----
-
-## Findings
-
-| Category | Severity | Tool | Detail |
-|----------|----------|------|--------|
-EOF
-}
-
-# ==========================================
-# START
-# ==========================================
-print_banner
-
-echo -e "${BOLD}Target    :${RESET} $target"
-echo -e "${BOLD}Output    :${RESET} $OUT_DIR"
-echo -e "${BOLD}Vuln Dir  :${RESET} $VULN_DIR"
-echo -e "${BOLD}Report    :${RESET} $REPORT_DIR"
-echo -e "${BOLD}Invasive  :${RESET} $INVASIVE"
-echo -e "${BOLD}Threads   :${RESET} $THREADS"
-echo -e "${BOLD}Rate      :${RESET} $RATE"
-echo -e "${BOLD}Severity  :${RESET} $SEVERITY"
-echo -e "${BOLD}Resume    :${RESET} $IS_RESUME"
-echo -e "${BOLD}PID       :${RESET} $$"
+echo ""
+echo -e "  ${BOLD}Target       :${RESET} $TARGET"
+echo -e "  ${BOLD}Output       :${RESET} $OUT_DIR"
+echo -e "  ${BOLD}Logs dir     :${RESET} $LOGS_DIR"
+echo -e "  ${BOLD}PID/PGID     :${RESET} $$ / $(cat "$OUT_DIR/.scan_pgid")"
+echo -e "  ${BOLD}Invasive     :${RESET} $INVASIVE"
+echo -e "  ${BOLD}Threads/Rate :${RESET} $THREADS / $RATE"
+echo -e "  ${BOLD}Severity     :${RESET} $SEVERITY"
+echo -e "  ${BOLD}Resume       :${RESET} $IS_RESUME"
 echo ""
 
-init_report
-start_network_watchdog
-
-# ==========================================
-# STEP 1: Nuclei - Full Vulnerability Scan
-# ==========================================
-STEP_NAME="nuclei_main"
-if [ "$SKIP_NUCLEI" = true ]; then
-    log_phase "Step 1: Nuclei Scan (Skipped via --skip-nuclei)"
-elif step_done "$STEP_NAME"; then
-    log_phase "Step 1: Nuclei Vulnerability Scan [ALREADY DONE — SKIPPED]"
+# ══ STEP 1: Nuclei ════════════════════════════════════════════
+STEP="nuclei_main"
+if [ "$SKIP_NUCLEI" = "true" ]; then
+    log_phase "Step 1: Nuclei Scan [SKIPPED via --skip-nuclei]"
+elif step_done "$STEP"; then
+    log_phase "Step 1: Nuclei Scan [DONE — SKIPPED]"
 else
     log_phase "Step 1: Nuclei Vulnerability Scan"
     wait_if_paused
 
     if require_tool nuclei && require_file "$OUT_DIR/web_alive.txt"; then
         awk '{print $1}' "$OUT_DIR/web_alive.txt" > "$VULN_DIR/nuclei_targets.txt"
+        log_info "Nuclei targets: $(count_lines "$VULN_DIR/nuclei_targets.txt")"
 
-        log_info "Updating Nuclei templates..."
-        nuclei -update-templates -silent 2>/dev/null
-
-        log_info "Running Nuclei (CVE + Tech + OSINT)..."
-        nuclei -l "$VULN_DIR/nuclei_targets.txt" \
-               -tags cve,osint,tech,exposure,misconfig,default-login \
-               -et dos,fuzzing,headless \
-               -severity "$SEVERITY" \
-               -rate-limit "$RATE" \
-               -silent \
-               -o "$VULN_DIR/nuclei_vulns.txt" \
-               -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-
-        wait_if_paused
-        log_info "Running Nuclei exposure scan..."
-        nuclei -l "$VULN_DIR/nuclei_targets.txt" \
-               -tags exposure,token,secret,api-key \
-               -silent \
-               -rate-limit "$RATE" \
-               -o "$VULN_DIR/nuclei_exposures.txt" \
-               -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-
-        wait_if_paused
-        if require_file "$OUT_DIR/final_subdomains.txt"; then
-            log_info "Checking for subdomain takeovers..."
-            nuclei -l "$OUT_DIR/final_subdomains.txt" \
-                   -tags takeover \
-                   -silent \
+        log_info "Running Nuclei — CVE/misconfig/exposure scan..."
+        run_tool "nuclei_vulns" "nuclei CVE+misconfig scan for $TARGET" \
+            nuclei -l "$VULN_DIR/nuclei_targets.txt" \
+                   -tags cve,osint,tech,exposure,misconfig,default-login \
+                   -et dos,fuzzing,headless \
+                   -severity "$SEVERITY" \
                    -rate-limit "$RATE" \
-                   -o "$VULN_DIR/nuclei_takeovers.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            TAKEOVER_COUNT=$(count_lines "$VULN_DIR/nuclei_takeovers.txt")
-            [ "$TAKEOVER_COUNT" -gt 0 ] && log_finding "CRITICAL" "Potential subdomain takeovers: $TAKEOVER_COUNT"
+                   -timeout "$NUCLEI_TIMEOUT" \
+                   -silent \
+                   -o "$VULN_DIR/nuclei_vulns.txt" \
+                   -t "$NUCLEI_TEMPLATES/"
+        wait_if_paused
+
+        log_info "Running Nuclei — exposure/secrets scan..."
+        run_tool "nuclei_exposures" "nuclei exposures+secrets scan for $TARGET" \
+            nuclei -l "$VULN_DIR/nuclei_targets.txt" \
+                   -tags exposure,token,secret,api-key \
+                   -rate-limit "$RATE" \
+                   -timeout "$NUCLEI_TIMEOUT" \
+                   -silent \
+                   -o "$VULN_DIR/nuclei_exposures.txt" \
+                   -t "$NUCLEI_TEMPLATES/"
+        wait_if_paused
+
+        if require_file "$OUT_DIR/final_subdomains.txt"; then
+            log_info "Running Nuclei — subdomain takeover check..."
+            run_tool "nuclei_takeovers" "nuclei takeover scan for $TARGET" \
+                nuclei -l "$OUT_DIR/final_subdomains.txt" \
+                       -tags takeover \
+                       -rate-limit "$RATE" \
+                       -timeout "$NUCLEI_TIMEOUT" \
+                       -silent \
+                       -o "$VULN_DIR/nuclei_takeovers.txt" \
+                       -t "$NUCLEI_TEMPLATES/"
+            local_n=$(count_lines "$VULN_DIR/nuclei_takeovers.txt")
+            [ "$local_n" -gt 0 ] && log_finding "CRITICAL" "Subdomain takeovers: $local_n — see $VULN_DIR/nuclei_takeovers.txt"
         fi
 
         NUCLEI_COUNT=$(count_lines "$VULN_DIR/nuclei_vulns.txt")
         EXPOSURE_COUNT=$(count_lines "$VULN_DIR/nuclei_exposures.txt")
-        log_success "Nuclei: ${BOLD}$NUCLEI_COUNT${RESET} vulnerabilities, ${BOLD}$EXPOSURE_COUNT${RESET} exposures"
-
-        if grep -qiE "critical|high" "$VULN_DIR/nuclei_vulns.txt" 2>/dev/null; then
-            log_finding "HIGH" "High/Critical Nuclei findings detected — review $VULN_DIR/nuclei_vulns.txt"
-            report_finding "Nuclei" "HIGH" "nuclei" "High/Critical findings: $NUCLEI_COUNT total"
-        fi
+        log_ok "Nuclei: ${BOLD}$NUCLEI_COUNT${RESET} vulns, ${BOLD}$EXPOSURE_COUNT${RESET} exposures"
+        grep -qiE "critical|high" "$VULN_DIR/nuclei_vulns.txt" 2>/dev/null \
+            && log_finding "HIGH" "High/Critical Nuclei findings — review $VULN_DIR/nuclei_vulns.txt"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 2: JavaScript Analysis
-# ==========================================
-STEP_NAME="js_analysis"
-if [ "$SKIP_JS" = true ]; then
-    log_phase "Step 2: JavaScript Analysis (Skipped via --skip-js)"
-elif step_done "$STEP_NAME"; then
-    log_phase "Step 2: JavaScript Analysis [ALREADY DONE — SKIPPED]"
+# ══ STEP 2: JavaScript Analysis ═══════════════════════════════
+STEP="js_analysis"
+if [ "$SKIP_JS" = "true" ]; then
+    log_phase "Step 2: JavaScript Analysis [SKIPPED via --skip-js]"
+elif step_done "$STEP"; then
+    log_phase "Step 2: JavaScript Analysis [DONE — SKIPPED]"
 else
     log_phase "Step 2: JavaScript Analysis"
     wait_if_paused
@@ -447,66 +335,57 @@ else
         JS_COUNT=$(count_lines "$VULN_DIR/js_files.txt")
 
         if [ "$JS_COUNT" -eq 0 ]; then
-            log_warn "No JS files found in clean_urls.txt"
+            log_warn "No JS files found in clean_urls.txt."
         else
-            log_info "Found ${BOLD}$JS_COUNT${RESET} JS files to analyze"
+            log_info "Found $JS_COUNT JS files to analyze"
 
             if require_tool nuclei; then
-                log_info "Scanning JS for secrets/tokens with Nuclei..."
-                nuclei -l "$VULN_DIR/js_files.txt" \
-                       -t "$NUCLEI_TEMPLATES/http/exposures/" \
-                       -tags token,secret,api-key,exposure \
-                       -silent \
-                       -o "$VULN_DIR/js_secrets.txt" 2>/dev/null
-                JS_SECRET_COUNT=$(count_lines "$VULN_DIR/js_secrets.txt")
-                [ "$JS_SECRET_COUNT" -gt 0 ] && log_finding "HIGH" "JS Secrets found: $JS_SECRET_COUNT"
-                log_success "JS Secrets: ${BOLD}$JS_SECRET_COUNT${RESET} findings"
+                log_info "Scanning JS for secrets with Nuclei..."
+                run_tool "js_secrets_nuclei" "nuclei JS secrets scan for $TARGET" \
+                    nuclei -l "$VULN_DIR/js_files.txt" \
+                           -t "$NUCLEI_TEMPLATES/http/exposures/" \
+                           -tags token,secret,api-key,exposure \
+                           -rate-limit "$RATE" \
+                           -timeout "$NUCLEI_TIMEOUT" \
+                           -silent \
+                           -o "$VULN_DIR/js_secrets.txt"
+                local_n=$(count_lines "$VULN_DIR/js_secrets.txt")
+                [ "$local_n" -gt 0 ] && log_finding "HIGH" "JS secrets: $local_n"
+                log_ok "JS secrets: $local_n"
             fi
-
             wait_if_paused
 
             if require_tool mantra; then
-                log_info "Mining JS for hidden endpoints with Mantra..."
-                cat "$VULN_DIR/js_files.txt" | mantra 2>/dev/null | sort -u > "$VULN_DIR/js_endpoints.txt"
-                JS_EP_COUNT=$(count_lines "$VULN_DIR/js_endpoints.txt")
-                log_success "JS Hidden Endpoints: ${BOLD}$JS_EP_COUNT${RESET}"
-                [ "$JS_EP_COUNT" -gt 0 ] && report_finding "JS Analysis" "MEDIUM" "mantra" "Hidden endpoints in JS: $JS_EP_COUNT"
+                log_info "Mantra — mining JS for hidden endpoints (timeout: 5m)..."
+                run_tool "mantra" "mantra JS endpoint mining for $TARGET" \
+                    bash -c "timeout 300 bash -c \
+                        \"cat '${VULN_DIR}/js_files.txt' | mantra | sort -u > '${VULN_DIR}/js_endpoints.txt'\" \
+                        || echo 'mantra: timed out after 5m'"
+                local_n=$(count_lines "$VULN_DIR/js_endpoints.txt")
+                log_ok "JS endpoints: $local_n"
+                [ "$local_n" -gt 0 ] && log_finding "INFO" "JS hidden endpoints: $local_n — see $VULN_DIR/js_endpoints.txt"
             fi
-
-            log_info "Extracting API paths from JS..."
-            while IFS= read -r jsurl; do
-                curl -sk --max-time 10 "$jsurl" 2>/dev/null \
-                    | grep -oP '(?:"|'"'"')(/[a-zA-Z0-9_/.-]{3,}(?:\?[^"'"'"']*)?|https?://[^"'"'"']+)(?:"|'"'"')' \
-                    | tr -d '"'"'" \
-                    | sort -u
-            done < "$VULN_DIR/js_files.txt" | sort -u > "$VULN_DIR/js_api_paths.txt"
-            JS_API_COUNT=$(count_lines "$VULN_DIR/js_api_paths.txt")
-            log_success "JS API Paths Extracted: ${BOLD}$JS_API_COUNT${RESET}"
-
             wait_if_paused
 
-            if require_tool trufflehog; then
-                log_info "Running TruffleHog on JS files..."
-                while IFS= read -r jsurl; do
-                    trufflehog --regex --entropy=False "$jsurl" 2>/dev/null
-                done < "$VULN_DIR/js_files.txt" | sort -u > "$VULN_DIR/trufflehog_secrets.txt"
-                TH_COUNT=$(count_lines "$VULN_DIR/trufflehog_secrets.txt")
-                [ "$TH_COUNT" -gt 0 ] && log_finding "CRITICAL" "TruffleHog secrets: $TH_COUNT"
-                log_success "TruffleHog: ${BOLD}$TH_COUNT${RESET} secrets"
-            fi
+            log_info "Extracting API paths from JS files..."
+            safe_touch "$VULN_DIR/js_api_paths.txt"
+            while IFS= read -r jsurl; do
+                curl -sk --max-time 10 "$jsurl" 2>>"$LOGS_DIR/js_api_curl.log" \
+                    | grep -oP '(?:"|'"'"')(/[a-zA-Z0-9_/.-]{3,}(?:\?[^"'"'"']*)?|https?://[^"'"'"']+)(?:"|'"'"')' \
+                    | tr -d '"'"'"
+            done < "$VULN_DIR/js_files.txt" | sort -u > "$VULN_DIR/js_api_paths.txt"
+            log_ok "JS API paths: $(count_lines "$VULN_DIR/js_api_paths.txt")"
         fi
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 3: Directory & File Fuzzing (FFUF)
-# ==========================================
-STEP_NAME="ffuf_fuzz"
-if [ "$SKIP_FFUF" = true ]; then
-    log_phase "Step 3: Directory & File Fuzzing (Skipped via --skip-ffuf)"
-elif step_done "$STEP_NAME"; then
-    log_phase "Step 3: Directory & File Fuzzing [ALREADY DONE — SKIPPED]"
+# ══ STEP 3: Directory Fuzzing (FFUF) ══════════════════════════
+STEP="ffuf_fuzz"
+if [ "$SKIP_FFUF" = "true" ]; then
+    log_phase "Step 3: FFUF [SKIPPED via --skip-ffuf]"
+elif step_done "$STEP"; then
+    log_phase "Step 3: FFUF [DONE — SKIPPED]"
 else
     log_phase "Step 3: Directory & File Fuzzing (FFUF)"
     wait_if_paused
@@ -515,526 +394,477 @@ else
         if [ ! -f "$FFUF_WORDLIST" ]; then
             log_error "Wordlist not found: $FFUF_WORDLIST — skipping FFUF."
         else
+            # Fuzz interesting-looking admin/api targets
             grep -iE "admin|dev|stage|test|api|corp|internal|portal|dashboard|manage|backend|uat" \
                 "$OUT_DIR/alive_urls_only.txt" \
                 | sort -u > "$VULN_DIR/ffuf_interesting.txt"
-
             INTERESTING_COUNT=$(count_lines "$VULN_DIR/ffuf_interesting.txt")
 
             if [ "$INTERESTING_COUNT" -gt 0 ]; then
-                log_info "Fuzzing ${BOLD}$INTERESTING_COUNT${RESET} interesting targets..."
-                ffuf -w "$FFUF_WORDLIST:FUZZ" \
-                     -w "$VULN_DIR/ffuf_interesting.txt:URL" \
-                     -u "URL/FUZZ" \
-                     -mc 200,201,204,301,302,403,405 \
-                     -fc 404,429 \
-                     -ac \
-                     -s \
-                     -t "$THREADS" \
-                     -rate "$RATE" \
-                     -timeout 10 \
-                     -o "$VULN_DIR/ffuf_interesting_results.json" \
-                     -of json 2>/dev/null
-                log_success "FFUF interesting targets done"
+                log_info "Fuzzing $INTERESTING_COUNT interesting targets with raft-small-words..."
+                run_tool "ffuf_interesting" "ffuf interesting targets for $TARGET" \
+                    ffuf -w "${FFUF_WORDLIST}:FUZZ" \
+                         -w "${VULN_DIR}/ffuf_interesting.txt:URL" \
+                         -u "URL/FUZZ" \
+                         -mc 200,201,204,301,302,403,405 \
+                         -fc 404,429 \
+                         -ac -s \
+                         -t "$THREADS" -rate "$RATE" -timeout 10 \
+                         -o "$VULN_DIR/ffuf_interesting_results.json" -of json
+            else
+                log_warn "No interesting admin/api targets found in alive_urls_only.txt"
             fi
-
             wait_if_paused
 
-            log_info "Scanning for backup & sensitive files..."
             BACKUP_WORDLIST="/usr/share/seclists/Discovery/Web-Content/raft-small-files.txt"
             if [ -f "$BACKUP_WORDLIST" ]; then
-                ffuf -w "$BACKUP_WORDLIST:FUZZ" \
-                     -w "$OUT_DIR/alive_urls_only.txt:URL" \
-                     -u "URL/FUZZ" \
-                     -mc 200,403 \
-                     -fc 404,429 \
-                     -ac \
-                     -s \
-                     -t "$THREADS" \
-                     -rate "$RATE" \
-                     -timeout 10 \
-                     -o "$VULN_DIR/ffuf_backup_files.json" \
-                     -of json 2>/dev/null
-                log_success "FFUF backup file scan done"
+                log_info "Scanning for backup & sensitive files..."
+                run_tool "ffuf_backup" "ffuf backup file scan for $TARGET" \
+                    ffuf -w "${BACKUP_WORDLIST}:FUZZ" \
+                         -w "${OUT_DIR}/alive_urls_only.txt:URL" \
+                         -u "URL/FUZZ" \
+                         -mc 200,403 -fc 404,429 \
+                         -ac -s \
+                         -t "$THREADS" -rate "$RATE" -timeout 10 \
+                         -o "$VULN_DIR/ffuf_backup_files.json" -of json
             fi
 
+            # Parse all JSON results to human-readable txt
             for json_file in "$VULN_DIR"/ffuf_*.json; do
-                if [ -f "$json_file" ]; then
-                    txt_file="${json_file%.json}.txt"
-                    python3 -c "
+                [ -f "$json_file" ] || continue
+                local_out="${json_file%.json}.txt"
+                python3 -c "
 import json, sys
 try:
-    with open('$json_file') as f:
+    with open('${json_file}') as f:
         data = json.load(f)
-    results = data.get('results', [])
-    for r in results:
-        print(f\"{r.get('status','?')} {r.get('length','?')} {r.get('url','?')}\")
-except:
-    pass
-" > "$txt_file" 2>/dev/null
-                fi
+    for r in data.get('results', []):
+        print(r.get('status','?'), r.get('length','?'), r.get('url','?'))
+except Exception as e:
+    print('parse error:', e)
+" > "$local_out" 2>>"$LOGS_DIR/ffuf_parse.log"
             done
 
             FFUF_COUNT=$(cat "$VULN_DIR"/ffuf_*.txt 2>/dev/null | wc -l)
-            log_success "FFUF Total Findings: ${BOLD}$FFUF_COUNT${RESET}"
-            [ "$FFUF_COUNT" -gt 0 ] && report_finding "FFUF" "MEDIUM" "ffuf" "Directory/file findings: $FFUF_COUNT"
+            log_ok "FFUF total findings: $FFUF_COUNT"
         fi
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 4: GF Pattern Filtering
-# ==========================================
-STEP_NAME="gf_patterns"
-if [ "$SKIP_GF" = true ]; then
-    log_phase "Step 4: GF Pattern Filtering (Skipped via --skip-gf)"
-elif step_done "$STEP_NAME"; then
-    log_phase "Step 4: GF Pattern Filtering [ALREADY DONE — SKIPPED]"
+# ══ STEP 4: GF Pattern Filtering ══════════════════════════════
+STEP="gf_patterns"
+if [ "$SKIP_GF" = "true" ]; then
+    log_phase "Step 4: GF Patterns [SKIPPED via --skip-gf]"
+elif step_done "$STEP"; then
+    log_phase "Step 4: GF Patterns [DONE — SKIPPED]"
 else
     log_phase "Step 4: GF Pattern Filtering"
     wait_if_paused
 
     if require_tool gf && require_file "$OUT_DIR/final_params.txt"; then
         PARAM_COUNT=$(count_lines "$OUT_DIR/final_params.txt")
-        log_info "Running GF patterns on ${BOLD}$PARAM_COUNT${RESET} URLs..."
+        log_info "GF patterns on $PARAM_COUNT URLs..."
 
-        declare -A GF_PATTERNS=(
-            ["ssrf"]="potential_ssrf.txt"
-            ["sqli"]="potential_sqli.txt"
-            ["lfi"]="potential_lfi.txt"
-            ["redirect"]="potential_redirect.txt"
-            ["rce"]="potential_rce.txt"
-            ["ssti"]="potential_ssti.txt"
-            ["idor"]="potential_idor.txt"
-            ["xss"]="potential_xss.txt"
-            ["xxe"]="potential_xxe.txt"
-            ["debug_logic"]="potential_debug.txt"
-        )
+        GF_PATTERNS=(ssrf sqli lfi redirect rce ssti idor xss xxe debug_logic)
 
-        for pattern in "${!GF_PATTERNS[@]}"; do
-            outfile="$VULN_DIR/${GF_PATTERNS[$pattern]}"
-            gf "$pattern" "$OUT_DIR/final_params.txt" 2>/dev/null | sort -u > "$outfile"
-            cnt=$(count_lines "$outfile")
-            if [ "$cnt" -gt 0 ]; then
-                log_finding "MEDIUM" "GF [$pattern]: $cnt potential URLs"
-                report_finding "GF Pattern" "MEDIUM" "gf" "$pattern: $cnt potential URLs"
+        for pattern in "${GF_PATTERNS[@]}"; do
+            local_out="$VULN_DIR/potential_${pattern}.txt"
+            run_tool "gf_${pattern}" "gf $pattern pattern filter for $TARGET" \
+                bash -c "gf '$pattern' '$OUT_DIR/final_params.txt' 2>/dev/null \
+                    | sort -u > '$local_out'"
+            local_cnt
+            local_cnt=$(count_lines "$local_out")
+            if [ "$local_cnt" -gt 0 ]; then
+                log_finding "MEDIUM" "GF [$pattern]: $local_cnt potential URLs"
             fi
+            log_info "  gf[$pattern]: $local_cnt URLs"
         done
-
-        log_success "GF filtering complete — check $VULN_DIR/potential_*.txt"
+        log_ok "GF filtering complete — results in $VULN_DIR/potential_*.txt"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 5: CORS Misconfiguration
-# ==========================================
-STEP_NAME="cors_check"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 5: CORS Misconfiguration [ALREADY DONE — SKIPPED]"
+# ══ STEP 5: CORS ══════════════════════════════════════════════
+STEP="cors_check"
+if step_done "$STEP"; then
+    log_phase "Step 5: CORS Check [DONE — SKIPPED]"
 else
     log_phase "Step 5: CORS Misconfiguration Check"
     wait_if_paused
 
     if require_file "$OUT_DIR/alive_urls_only.txt"; then
+        safe_touch "$VULN_DIR/cors_findings.txt"
         if require_tool corsy; then
             log_info "Running Corsy..."
-            corsy -i "$OUT_DIR/alive_urls_only.txt" \
-                  -t "$THREADS" \
-                  --headers "User-Agent: Mozilla/5.0" \
-                  > "$VULN_DIR/cors_findings.txt" 2>/dev/null
-            CORS_COUNT=$(grep -c "CORS" "$VULN_DIR/cors_findings.txt" 2>/dev/null || echo 0)
+            run_tool "corsy" "corsy CORS check for $TARGET" \
+                corsy -i "$OUT_DIR/alive_urls_only.txt" -t "$THREADS" \
+                      --headers "User-Agent: Mozilla/5.0"
+            # corsy writes to stdout so we need to capture differently
+            run_tool "corsy_out" "corsy CORS check output for $TARGET" \
+                bash -c "corsy -i '$OUT_DIR/alive_urls_only.txt' -t '$THREADS' \
+                    --headers 'User-Agent: Mozilla/5.0' > '$VULN_DIR/cors_findings.txt' 2>&1"
+            CORS_COUNT=$(grep -c "CORS" "$VULN_DIR/cors_findings.txt" 2>/dev/null) || CORS_COUNT=0
         elif require_tool nuclei; then
             log_info "Checking CORS with Nuclei..."
-            nuclei -l "$OUT_DIR/alive_urls_only.txt" \
-                   -tags cors \
-                   -silent \
-                   -o "$VULN_DIR/cors_findings.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
+            run_tool "nuclei_cors" "nuclei CORS check for $TARGET" \
+                nuclei -l "$OUT_DIR/alive_urls_only.txt" \
+                       -tags cors -silent \
+                       -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
+                       -o "$VULN_DIR/cors_findings.txt" \
+                       -t "$NUCLEI_TEMPLATES/"
             CORS_COUNT=$(count_lines "$VULN_DIR/cors_findings.txt")
+        else
+            CORS_COUNT=0
         fi
-
-        [ "${CORS_COUNT:-0}" -gt 0 ] && \
-            log_finding "HIGH" "CORS misconfigurations: $CORS_COUNT" && \
-            report_finding "CORS" "HIGH" "corsy/nuclei" "Misconfigurations: $CORS_COUNT"
-        log_success "CORS: ${BOLD}${CORS_COUNT:-0}${RESET} findings"
+        [ "$CORS_COUNT" -gt 0 ] && log_finding "HIGH" "CORS misconfigurations: $CORS_COUNT"
+        log_ok "CORS: $CORS_COUNT findings"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 6: HTTP Headers & SSL/TLS Check
-# ==========================================
-STEP_NAME="headers_ssl"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 6: HTTP Security Headers & SSL/TLS [ALREADY DONE — SKIPPED]"
+# ══ STEP 6: Headers & SSL ═════════════════════════════════════
+STEP="headers_ssl"
+if step_done "$STEP"; then
+    log_phase "Step 6: Headers & SSL [DONE — SKIPPED]"
 else
     log_phase "Step 6: HTTP Security Headers & SSL/TLS"
     wait_if_paused
 
-    if require_file "$OUT_DIR/alive_urls_only.txt"; then
-        if require_tool nuclei; then
-            log_info "Checking missing security headers..."
+    if require_file "$OUT_DIR/alive_urls_only.txt" && require_tool nuclei; then
+        log_info "Checking security headers and SSL..."
+        run_tool "nuclei_headers_ssl" "nuclei headers+SSL check for $TARGET" \
             nuclei -l "$OUT_DIR/alive_urls_only.txt" \
                    -tags headers,ssl,tls,misconfiguration \
+                   -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
                    -silent \
-                   -rate-limit "$RATE" \
                    -o "$VULN_DIR/headers_ssl_findings.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            HEADER_COUNT=$(count_lines "$VULN_DIR/headers_ssl_findings.txt")
-            [ "$HEADER_COUNT" -gt 0 ] && log_finding "LOW" "Security header/SSL issues: $HEADER_COUNT"
-            log_success "Headers/SSL: ${BOLD}$HEADER_COUNT${RESET} findings"
-        fi
-
-        if require_tool testssl.sh; then
-            log_info "Running testssl.sh on apex domain..."
-            testssl.sh --quiet --jsonfile "$VULN_DIR/testssl.json" "$target" 2>/dev/null
-            log_success "testssl.sh complete — $VULN_DIR/testssl.json"
-        fi
+                   -t "$NUCLEI_TEMPLATES/"
+        local_n=$(count_lines "$VULN_DIR/headers_ssl_findings.txt")
+        [ "$local_n" -gt 0 ] && log_finding "LOW" "Header/SSL issues: $local_n"
+        log_ok "Headers/SSL: $local_n findings"
     fi
-    mark_step_done "$STEP_NAME"
+
+    if require_tool testssl.sh; then
+        log_info "testssl.sh on apex domain..."
+        run_tool "testssl" "testssl.sh for $TARGET" \
+            testssl.sh --quiet --jsonfile "$VULN_DIR/testssl.json" "$TARGET"
+        log_ok "testssl.sh complete"
+    fi
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 7: Open Redirect Check
-# ==========================================
-STEP_NAME="open_redirect"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 7: Open Redirect Check [ALREADY DONE — SKIPPED]"
+# ══ STEP 7: Open Redirects ════════════════════════════════════
+STEP="open_redirect"
+if step_done "$STEP"; then
+    log_phase "Step 7: Open Redirect Check [DONE — SKIPPED]"
 else
     log_phase "Step 7: Open Redirect Check"
     wait_if_paused
+    safe_touch "$VULN_DIR/potential_redirect.txt"
 
-    if require_file "$VULN_DIR/potential_redirect.txt"; then
-        REDIRECT_COUNT=$(count_lines "$VULN_DIR/potential_redirect.txt")
-        log_info "Testing ${BOLD}$REDIRECT_COUNT${RESET} potential open redirect URLs..."
-
-        if require_tool nuclei && [ "$REDIRECT_COUNT" -gt 0 ]; then
+    REDIRECT_COUNT=$(count_lines "$VULN_DIR/potential_redirect.txt")
+    if [ "$REDIRECT_COUNT" -gt 0 ] && require_tool nuclei; then
+        log_info "Testing $REDIRECT_COUNT redirect candidates..."
+        run_tool "nuclei_redirect" "nuclei open redirect check for $TARGET" \
             nuclei -l "$VULN_DIR/potential_redirect.txt" \
-                   -tags redirect \
-                   -silent \
+                   -tags redirect -silent \
+                   -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
                    -o "$VULN_DIR/confirmed_redirects.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            CONFIRMED=$(count_lines "$VULN_DIR/confirmed_redirects.txt")
-            [ "$CONFIRMED" -gt 0 ] && log_finding "MEDIUM" "Confirmed open redirects: $CONFIRMED" && \
-                report_finding "Open Redirect" "MEDIUM" "nuclei" "Confirmed: $CONFIRMED"
-            log_success "Open Redirects Confirmed: ${BOLD}$CONFIRMED${RESET}"
-        fi
+                   -t "$NUCLEI_TEMPLATES/"
+        local_n=$(count_lines "$VULN_DIR/confirmed_redirects.txt")
+        [ "$local_n" -gt 0 ] && log_finding "MEDIUM" "Confirmed open redirects: $local_n"
+        log_ok "Open redirects confirmed: $local_n"
     else
-        safe_touch "$VULN_DIR/potential_redirect.txt"
-        log_warn "No redirect candidates — run GF step first or check final_params.txt"
+        [ "$REDIRECT_COUNT" -eq 0 ] && log_warn "No redirect candidates — run GF step first (bbq retry $TARGET --redo gf)"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 8: SQLi Testing (sqlmap) — Invasive
-# ==========================================
-STEP_NAME="sqli_sqlmap"
+# ══ STEP 8: SQLi — Invasive Only ══════════════════════════════
+STEP="sqli_sqlmap"
 if [ "$INVASIVE" = "true" ]; then
-    if step_done "$STEP_NAME"; then
-        log_phase "Step 8: SQLi Testing [ALREADY DONE — SKIPPED]"
+    if step_done "$STEP"; then
+        log_phase "Step 8: SQLi Testing [DONE — SKIPPED]"
     else
         log_phase "Step 8: SQLi Testing (sqlmap) [INVASIVE]"
         wait_if_paused
 
         if require_tool sqlmap && require_file "$VULN_DIR/potential_sqli.txt"; then
             SQLI_COUNT=$(count_lines "$VULN_DIR/potential_sqli.txt")
-            log_info "Testing ${BOLD}$SQLI_COUNT${RESET} potential SQLi targets with sqlmap..."
-
-            sqlmap -m "$VULN_DIR/potential_sqli.txt" \
-                   --batch \
-                   --level=2 \
-                   --risk=2 \
-                   --threads="$THREADS" \
-                   --output-dir="$VULN_DIR/sqlmap/" \
-                   --forms \
-                   --crawl=2 \
-                   --random-agent \
-                   --timeout=10 \
-                   --retries=2 \
-                   -q 2>/dev/null
-
-            SQLI_FINDINGS=$(find "$VULN_DIR/sqlmap/" -name "*.csv" 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
-            log_success "SQLmap done — check $VULN_DIR/sqlmap/"
-            [ -n "$SQLI_FINDINGS" ] && report_finding "SQLi" "CRITICAL" "sqlmap" "Potential injections found"
+            log_info "Testing $SQLI_COUNT SQLi candidates..."
+            run_tool "sqlmap" "sqlmap SQLi test for $TARGET" \
+                sqlmap -m "$VULN_DIR/potential_sqli.txt" \
+                       --batch --level=2 --risk=2 \
+                       --threads="$THREADS" \
+                       --output-dir="$VULN_DIR/sqlmap/" \
+                       --forms --crawl=2 --random-agent \
+                       --timeout=10 --retries=2
+            log_ok "sqlmap done — results in $VULN_DIR/sqlmap/"
         else
-            log_warn "SQLi: potential_sqli.txt missing or sqlmap not found. Run GF step first."
+            log_warn "No SQLi candidates or sqlmap not found — run: bbq retry $TARGET --redo gf"
         fi
-        mark_step_done "$STEP_NAME"
+        mark_step_done "$STEP"
     fi
 else
-    log_phase "Step 8: SQLi Testing (Skipped — use --invasive to enable)"
+    log_phase "Step 8: SQLi Testing [SKIPPED — use --invasive to enable]"
 fi
 
-# ==========================================
-# STEP 9: XSS Testing (Dalfox) — Invasive
-# ==========================================
-STEP_NAME="xss_dalfox"
+# ══ STEP 9: XSS (Dalfox) — Invasive Only ══════════════════════
+STEP="xss_dalfox"
 if [ "$INVASIVE" = "true" ]; then
-    if step_done "$STEP_NAME"; then
-        log_phase "Step 9: XSS Testing (Dalfox) [ALREADY DONE — SKIPPED]"
+    if step_done "$STEP"; then
+        log_phase "Step 9: XSS Testing [DONE — SKIPPED]"
     else
         log_phase "Step 9: XSS Testing (Dalfox) [INVASIVE]"
         wait_if_paused
 
         if require_tool dalfox; then
-            if [ -s "$VULN_DIR/potential_xss.txt" ]; then
-                XSS_INPUT="$VULN_DIR/potential_xss.txt"
-            elif [ -f "$OUT_DIR/final_params.txt" ]; then
-                XSS_INPUT="$OUT_DIR/final_params.txt"
-            else
-                XSS_INPUT=""
-            fi
+            XSS_INPUT=""
+            [ -s "$VULN_DIR/potential_xss.txt" ]     && XSS_INPUT="$VULN_DIR/potential_xss.txt"
+            [ -z "$XSS_INPUT" ] && [ -f "$OUT_DIR/final_params.txt" ] && XSS_INPUT="$OUT_DIR/final_params.txt"
 
             if [ -n "$XSS_INPUT" ]; then
-                XSS_COUNT=$(count_lines "$XSS_INPUT")
-                log_info "Testing ${BOLD}$XSS_COUNT${RESET} URLs for XSS with Dalfox..."
-
-                dalfox file "$XSS_INPUT" \
-                       --skip-bav \
-                       --silence \
-                       --no-color \
-                       --worker "$THREADS" \
-                       --timeout 10 \
-                       --output "$VULN_DIR/dalfox_xss.txt" 2>/dev/null
-
-                XSS_FOUND=$(count_lines "$VULN_DIR/dalfox_xss.txt")
-                [ "$XSS_FOUND" -gt 0 ] && log_finding "HIGH" "XSS confirmed: $XSS_FOUND" && \
-                    report_finding "XSS" "HIGH" "dalfox" "Confirmed XSS: $XSS_FOUND"
-                log_success "Dalfox: ${BOLD}$XSS_FOUND${RESET} XSS confirmed"
+                log_info "Dalfox on $(count_lines "$XSS_INPUT") URLs..."
+                run_tool "dalfox" "dalfox XSS scan for $TARGET" \
+                    dalfox file "$XSS_INPUT" \
+                           --skip-bav --silence --no-color \
+                           --worker "$THREADS" --timeout 10 \
+                           --output "$VULN_DIR/dalfox_xss.txt"
+                local_n=$(count_lines "$VULN_DIR/dalfox_xss.txt")
+                [ "$local_n" -gt 0 ] && log_finding "HIGH" "XSS confirmed: $local_n"
+                log_ok "Dalfox: $local_n XSS confirmed"
             else
-                log_warn "No XSS input file available."
+                log_warn "No XSS input — run: bbq retry $TARGET --redo gf"
             fi
         fi
-        mark_step_done "$STEP_NAME"
+        mark_step_done "$STEP"
     fi
 else
-    log_phase "Step 9: XSS Testing (Skipped — use --invasive to enable)"
+    log_phase "Step 9: XSS Testing [SKIPPED — use --invasive to enable]"
 fi
 
-# ==========================================
-# STEP 10: SSRF Testing
-# ==========================================
-STEP_NAME="ssrf_test"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 10: SSRF Testing [ALREADY DONE — SKIPPED]"
+# ══ STEP 10: SSRF ═════════════════════════════════════════════
+STEP="ssrf_test"
+if step_done "$STEP"; then
+    log_phase "Step 10: SSRF Testing [DONE — SKIPPED]"
 else
     log_phase "Step 10: SSRF Testing"
     wait_if_paused
+    safe_touch "$VULN_DIR/potential_ssrf.txt"
 
-    if require_file "$VULN_DIR/potential_ssrf.txt"; then
-        SSRF_COUNT=$(count_lines "$VULN_DIR/potential_ssrf.txt")
-        log_info "Testing ${BOLD}$SSRF_COUNT${RESET} potential SSRF URLs..."
-
-        if require_tool nuclei; then
+    SSRF_COUNT=$(count_lines "$VULN_DIR/potential_ssrf.txt")
+    if [ "$SSRF_COUNT" -gt 0 ] && require_tool nuclei; then
+        log_info "Testing $SSRF_COUNT SSRF candidates..."
+        run_tool "nuclei_ssrf" "nuclei SSRF test for $TARGET" \
             nuclei -l "$VULN_DIR/potential_ssrf.txt" \
-                   -tags ssrf \
-                   -silent \
+                   -tags ssrf -silent \
+                   -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
                    -o "$VULN_DIR/confirmed_ssrf.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            SSRF_CONFIRMED=$(count_lines "$VULN_DIR/confirmed_ssrf.txt")
-            [ "$SSRF_CONFIRMED" -gt 0 ] && log_finding "HIGH" "SSRF confirmed: $SSRF_CONFIRMED" && \
-                report_finding "SSRF" "HIGH" "nuclei" "Confirmed: $SSRF_CONFIRMED"
-            log_success "SSRF: ${BOLD}$SSRF_CONFIRMED${RESET} confirmed"
-        fi
+                   -t "$NUCLEI_TEMPLATES/"
+        local_n=$(count_lines "$VULN_DIR/confirmed_ssrf.txt")
+        [ "$local_n" -gt 0 ] && log_finding "HIGH" "SSRF confirmed: $local_n"
+        log_ok "SSRF confirmed: $local_n"
     else
-        safe_touch "$VULN_DIR/potential_ssrf.txt"
-        log_warn "No SSRF candidates — run GF step first."
+        [ "$SSRF_COUNT" -eq 0 ] && log_warn "No SSRF candidates — run: bbq retry $TARGET --redo gf"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 11: LFI Testing
-# ==========================================
-STEP_NAME="lfi_test"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 11: LFI Testing [ALREADY DONE — SKIPPED]"
+# ══ STEP 11: LFI ══════════════════════════════════════════════
+STEP="lfi_test"
+if step_done "$STEP"; then
+    log_phase "Step 11: LFI Testing [DONE — SKIPPED]"
 else
     log_phase "Step 11: LFI Testing"
     wait_if_paused
+    safe_touch "$VULN_DIR/potential_lfi.txt"
 
-    if require_file "$VULN_DIR/potential_lfi.txt"; then
-        LFI_COUNT=$(count_lines "$VULN_DIR/potential_lfi.txt")
-        log_info "Testing ${BOLD}$LFI_COUNT${RESET} potential LFI URLs..."
-
-        if require_tool nuclei; then
+    LFI_COUNT=$(count_lines "$VULN_DIR/potential_lfi.txt")
+    if [ "$LFI_COUNT" -gt 0 ] && require_tool nuclei; then
+        log_info "Testing $LFI_COUNT LFI candidates..."
+        run_tool "nuclei_lfi" "nuclei LFI test for $TARGET" \
             nuclei -l "$VULN_DIR/potential_lfi.txt" \
-                   -tags lfi,traversal \
-                   -silent \
+                   -tags lfi,traversal -silent \
                    -c "$THREADS" \
+                   -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
                    -o "$VULN_DIR/confirmed_lfi.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            LFI_CONFIRMED=$(count_lines "$VULN_DIR/confirmed_lfi.txt")
-            [ "$LFI_CONFIRMED" -gt 0 ] && log_finding "HIGH" "LFI confirmed: $LFI_CONFIRMED" && \
-                report_finding "LFI" "HIGH" "nuclei" "Confirmed: $LFI_CONFIRMED"
-            log_success "LFI: ${BOLD}$LFI_CONFIRMED${RESET} confirmed"
-        fi
+                   -t "$NUCLEI_TEMPLATES/"
+        local_n=$(count_lines "$VULN_DIR/confirmed_lfi.txt")
+        [ "$local_n" -gt 0 ] && log_finding "HIGH" "LFI confirmed: $local_n"
+        log_ok "LFI confirmed: $local_n"
     else
-        safe_touch "$VULN_DIR/potential_lfi.txt"
-        log_warn "No LFI candidates — run GF step first."
+        [ "$LFI_COUNT" -eq 0 ] && log_warn "No LFI candidates — run: bbq retry $TARGET --redo gf"
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# STEP 12: 403 Bypass Attempts
-# ==========================================
-STEP_NAME="403_bypass"
-if step_done "$STEP_NAME"; then
-    log_phase "Step 12: 403 Bypass [ALREADY DONE — SKIPPED]"
+# ══ STEP 12: 403 Bypass ═══════════════════════════════════════
+STEP="403_bypass"
+if step_done "$STEP"; then
+    log_phase "Step 12: 403 Bypass [DONE — SKIPPED]"
 else
     log_phase "Step 12: 403 Bypass"
     wait_if_paused
 
-    if require_tool nuclei && require_file "$OUT_DIR/alive_urls_only.txt"; then
-        log_info "Testing 403 responses for bypass opportunities..."
-        grep " 403 " "$OUT_DIR/web_alive.txt" 2>/dev/null | awk '{print $1}' > "$VULN_DIR/403_pages.txt"
+    if require_tool nuclei && require_file "$OUT_DIR/web_alive.txt"; then
+        grep " 403 " "$OUT_DIR/web_alive.txt" 2>/dev/null \
+            | awk '{print $1}' > "$VULN_DIR/403_pages.txt"
         BYPASS_TARGETS=$(count_lines "$VULN_DIR/403_pages.txt")
 
         if [ "$BYPASS_TARGETS" -gt 0 ]; then
-            nuclei -l "$VULN_DIR/403_pages.txt" \
-                   -tags bypass,403 \
-                   -silent \
-                   -o "$VULN_DIR/403_bypass.txt" \
-                   -t "$NUCLEI_TEMPLATES/" 2>/dev/null
-            BYPASS_COUNT=$(count_lines "$VULN_DIR/403_bypass.txt")
-            [ "$BYPASS_COUNT" -gt 0 ] && log_finding "MEDIUM" "403 bypasses found: $BYPASS_COUNT" && \
-                report_finding "403 Bypass" "MEDIUM" "nuclei" "Bypasses: $BYPASS_COUNT"
-            log_success "403 Bypass: ${BOLD}$BYPASS_COUNT${RESET} findings on $BYPASS_TARGETS targets"
+            log_info "Testing $BYPASS_TARGETS 403 pages for bypass..."
+            run_tool "nuclei_403bypass" "nuclei 403 bypass for $TARGET" \
+                nuclei -l "$VULN_DIR/403_pages.txt" \
+                       -tags bypass,403 -silent \
+                       -rate-limit "$RATE" -timeout "$NUCLEI_TIMEOUT" \
+                       -o "$VULN_DIR/403_bypass.txt" \
+                       -t "$NUCLEI_TEMPLATES/"
+            local_n=$(count_lines "$VULN_DIR/403_bypass.txt")
+            [ "$local_n" -gt 0 ] && log_finding "MEDIUM" "403 bypasses: $local_n"
+            log_ok "403 bypass: $local_n findings"
         else
-            log_warn "No 403 pages found to test."
+            log_warn "No 403 pages found in web_alive.txt."
         fi
     fi
-    mark_step_done "$STEP_NAME"
+    mark_step_done "$STEP"
 fi
 
-# ==========================================
-# FINAL: Generate HTML Report
-# ==========================================
+# ── Generate HTML Report ──────────────────────────────────────
 log_phase "Generating Report"
 
+SCAN_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
-ELAPSED_FMT=$(printf "%02d:%02d:%02d" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60)))
+ELAPSED=$(( END_TIME - START_TIME ))
+ELAPSED_FMT=$(printf "%02d:%02d:%02d" $(( ELAPSED/3600 )) $(( ELAPSED%3600/60 )) $(( ELAPSED%60 )))
 
-# Update summary counts in markdown
-sed -i "s/| Nuclei Findings | - |/| Nuclei Findings | $(count_lines "$VULN_DIR/nuclei_vulns.txt") |/" "$REPORT_MD"
-sed -i "s/| JS Secrets | - |/| JS Secrets | $(count_lines "$VULN_DIR/js_secrets.txt") |/" "$REPORT_MD"
-sed -i "s/| Potential SSRF | - |/| Potential SSRF | $(count_lines "$VULN_DIR/potential_ssrf.txt") |/" "$REPORT_MD"
-sed -i "s/| Potential SQLi | - |/| Potential SQLi | $(count_lines "$VULN_DIR/potential_sqli.txt") |/" "$REPORT_MD"
-sed -i "s/| Potential LFI | - |/| Potential LFI | $(count_lines "$VULN_DIR/potential_lfi.txt") |/" "$REPORT_MD"
-sed -i "s/| Potential RCE | - |/| Potential RCE | $(count_lines "$VULN_DIR/potential_rce.txt") |/" "$REPORT_MD"
-sed -i "s/| Open Redirects | - |/| Open Redirects | $(count_lines "$VULN_DIR/confirmed_redirects.txt") |/" "$REPORT_MD"
-sed -i "s/| XSS (Dalfox) | - |/| XSS (Dalfox) | $(count_lines "$VULN_DIR/dalfox_xss.txt") |/" "$REPORT_MD"
-sed -i "s/| FFUF Findings | - |/| FFUF Findings | $(cat "$VULN_DIR"/ffuf_*.txt 2>/dev/null | wc -l) |/" "$REPORT_MD"
+REPORT_HTML="$REPORT_DIR/report.html"
 
-if [ -s "$VULN_DIR/nuclei_vulns.txt" ]; then
-    echo -e "\n---\n\n## Nuclei Findings\n\n\`\`\`" >> "$REPORT_MD"
-    cat "$VULN_DIR/nuclei_vulns.txt" >> "$REPORT_MD"
-    echo '```' >> "$REPORT_MD"
-fi
-
-if require_tool pandoc; then
-    pandoc "$REPORT_MD" \
-           -o "$REPORT_HTML" \
-           --standalone \
-           --metadata title="Vuln Scan: $target" \
-           --css "https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown.min.css" \
-           2>/dev/null
-    log_success "HTML report generated: $REPORT_HTML"
-else
-    cat > "$REPORT_HTML" <<HTMLEOF
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Vuln Scan: $target</title>
+{
+    echo '<!DOCTYPE html><html>'
+    echo '<head><meta charset="UTF-8">'
+    printf '<title>Scan: %s</title>\n' "$TARGET"
+    cat << 'CSS'
 <style>
-body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2em; max-width: 1200px; margin: auto; }
-h1,h2,h3 { color: #ff6b6b; }
-h2 { border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
-table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-th { background: #21262d; color: #ff6b6b; padding: 8px 12px; text-align: left; }
-td { padding: 6px 12px; border-bottom: 1px solid #21262d; }
-tr:hover td { background: #161b22; }
-code, pre { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
-pre { padding: 1em; overflow-x: auto; white-space: pre-wrap; }
-</style>
-</head>
-<body>
-<h1>🔴 Vulnerability Scan Report</h1>
-<p><strong>Target:</strong> <code>$target</code> &nbsp;|&nbsp;
-   <strong>Date:</strong> $SCAN_DATE &nbsp;|&nbsp;
-   <strong>Duration:</strong> $ELAPSED_FMT &nbsp;|&nbsp;
-   <strong>Mode:</strong> $([ "$INVASIVE" = "true" ] && echo "Invasive" || echo "Passive")</p>
-<hr>
-<h2>📊 Summary</h2>
-<table>
-<tr><th>Category</th><th>Count</th></tr>
-<tr><td>Nuclei Vulnerabilities</td><td>$(count_lines "$VULN_DIR/nuclei_vulns.txt")</td></tr>
-<tr><td>Nuclei Exposures</td><td>$(count_lines "$VULN_DIR/nuclei_exposures.txt")</td></tr>
-<tr><td>Subdomain Takeovers</td><td>$(count_lines "$VULN_DIR/nuclei_takeovers.txt")</td></tr>
-<tr><td>JS Secrets</td><td>$(count_lines "$VULN_DIR/js_secrets.txt")</td></tr>
-<tr><td>JS Endpoints</td><td>$(count_lines "$VULN_DIR/js_endpoints.txt")</td></tr>
-<tr><td>CORS Issues</td><td>$(count_lines "$VULN_DIR/cors_findings.txt")</td></tr>
-<tr><td>Header/SSL Issues</td><td>$(count_lines "$VULN_DIR/headers_ssl_findings.txt")</td></tr>
-<tr><td>Open Redirects</td><td>$(count_lines "$VULN_DIR/confirmed_redirects.txt")</td></tr>
-<tr><td>SSRF Confirmed</td><td>$(count_lines "$VULN_DIR/confirmed_ssrf.txt")</td></tr>
-<tr><td>LFI Confirmed</td><td>$(count_lines "$VULN_DIR/confirmed_lfi.txt")</td></tr>
-<tr><td>XSS (Dalfox)</td><td>$(count_lines "$VULN_DIR/dalfox_xss.txt")</td></tr>
-<tr><td>403 Bypasses</td><td>$(count_lines "$VULN_DIR/403_bypass.txt")</td></tr>
-</table>
-<h2>🚨 Nuclei Vulnerabilities</h2>
-<pre>$(cat "$VULN_DIR/nuclei_vulns.txt" 2>/dev/null || echo "No findings")</pre>
-<h2>🔑 JS Secrets</h2>
-<pre>$(cat "$VULN_DIR/js_secrets.txt" 2>/dev/null || echo "No findings")</pre>
-<h2>🌐 CORS Findings</h2>
-<pre>$(cat "$VULN_DIR/cors_findings.txt" 2>/dev/null || echo "No findings")</pre>
-<h2>💉 XSS (Dalfox)</h2>
-<pre>$(cat "$VULN_DIR/dalfox_xss.txt" 2>/dev/null || echo "No findings / invasive mode disabled")</pre>
-<h2>📝 Output Files</h2>
-<table><tr><th>File</th><th>Lines</th></tr>
-HTMLEOF
+body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:2em;max-width:1200px;margin:auto}
+h1,h2,h3{color:#ff6b6b}
+h2{border-bottom:1px solid #30363d;padding-bottom:.3em}
+table{border-collapse:collapse;width:100%;margin:1em 0}
+th{background:#21262d;color:#ff6b6b;padding:8px 12px;text-align:left}
+td{padding:6px 12px;border-bottom:1px solid #21262d}
+tr:hover td{background:#161b22}
+code,pre{background:#161b22;padding:2px 6px;border-radius:4px;color:#79c0ff}
+pre{padding:1em;overflow-x:auto;white-space:pre-wrap}
+.crit{color:#ff4444;font-weight:bold}
+.high{color:#ff6b6b}
+.med{color:#f0a500}
+.low{color:#58a6ff}
+</style></head><body>
+CSS
+    printf '<h1>&#x1F534; Scan Report — %s</h1>\n' "$TARGET"
+    printf '<p><strong>Date:</strong> %s &nbsp;|&nbsp; <strong>Duration:</strong> %s &nbsp;|&nbsp; <strong>Mode:</strong> %s</p>\n' \
+        "$SCAN_DATE" "$ELAPSED_FMT" "$([ "$INVASIVE" = "true" ] && echo "Invasive" || echo "Passive")"
 
+    echo '<h2>Summary</h2><table>'
+    echo '<tr><th>Category</th><th>Count</th><th>Severity</th></tr>'
+
+    _row() { printf '<tr><td>%s</td><td>%s</td><td class="%s">%s</td></tr>\n' \
+        "$1" "$(count_lines "$2")" "$3" "$4"; }
+
+    _row "Nuclei Vulns"        "$VULN_DIR/nuclei_vulns.txt"        "high"  "HIGH"
+    _row "Nuclei Exposures"    "$VULN_DIR/nuclei_exposures.txt"    "med"   "MEDIUM"
+    _row "Subdomain Takeovers" "$VULN_DIR/nuclei_takeovers.txt"    "crit"  "CRITICAL"
+    _row "JS Secrets"          "$VULN_DIR/js_secrets.txt"          "high"  "HIGH"
+    _row "JS Endpoints"        "$VULN_DIR/js_endpoints.txt"        "low"   "INFO"
+    _row "CORS Issues"         "$VULN_DIR/cors_findings.txt"       "high"  "HIGH"
+    _row "Header/SSL Issues"   "$VULN_DIR/headers_ssl_findings.txt" "low"  "LOW"
+    _row "Open Redirects"      "$VULN_DIR/confirmed_redirects.txt" "med"   "MEDIUM"
+    _row "SSRF Confirmed"      "$VULN_DIR/confirmed_ssrf.txt"      "high"  "HIGH"
+    _row "LFI Confirmed"       "$VULN_DIR/confirmed_lfi.txt"       "high"  "HIGH"
+    _row "XSS (Dalfox)"        "$VULN_DIR/dalfox_xss.txt"         "high"  "HIGH"
+    _row "403 Bypasses"        "$VULN_DIR/403_bypass.txt"          "med"   "MEDIUM"
+
+    echo '</table>'
+
+    _section() {
+        local title="$1" file="$2"
+        local n
+        n=$(count_lines "$file")
+        [ "$n" -eq 0 ] && return
+        printf '<h2>%s (%s)</h2><pre>' "$title" "$n"
+        # Escape HTML entities to prevent XSS in our own report
+        sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$file"
+        echo '</pre>'
+    }
+
+    _section "Nuclei Vulns"         "$VULN_DIR/nuclei_vulns.txt"
+    _section "Nuclei Exposures"     "$VULN_DIR/nuclei_exposures.txt"
+    _section "Subdomain Takeovers"  "$VULN_DIR/nuclei_takeovers.txt"
+    _section "JS Secrets"           "$VULN_DIR/js_secrets.txt"
+    _section "CORS Findings"        "$VULN_DIR/cors_findings.txt"
+    _section "SSRF Confirmed"       "$VULN_DIR/confirmed_ssrf.txt"
+    _section "LFI Confirmed"        "$VULN_DIR/confirmed_lfi.txt"
+    _section "XSS Confirmed"        "$VULN_DIR/dalfox_xss.txt"
+    _section "403 Bypasses"         "$VULN_DIR/403_bypass.txt"
+
+    echo '<h2>Output Files</h2><table>'
+    echo '<tr><th>File</th><th>Lines</th></tr>'
     for f in "$VULN_DIR"/*.txt; do
-        [ -f "$f" ] && echo "<tr><td><code>$(basename "$f")</code></td><td>$(wc -l < "$f")</td></tr>" >> "$REPORT_HTML"
+        [ -f "$f" ] && printf '<tr><td><code>%s</code></td><td>%s</td></tr>\n' \
+            "$(basename "$f")" "$(wc -l < "$f")"
     done
+    echo '</table>'
+    echo '<h2>Tool Logs</h2><table>'
+    echo '<tr><th>Log</th><th>Size</th></tr>'
+    for f in "$LOGS_DIR"/*.log; do
+        [ -f "$f" ] && printf '<tr><td><code>%s</code></td><td>%s</td></tr>\n' \
+            "$(basename "$f")" "$(wc -l < "$f") lines"
+    done
+    echo '</table>'
+    printf '<p style="color:#8b949e;margin-top:3em;font-size:.85em">scan.sh v4.0 | %s | %s</p>' \
+        "$ELAPSED_FMT" "$SCAN_DATE"
+    echo '</body></html>'
+} > "$REPORT_HTML"
 
-    cat >> "$REPORT_HTML" <<HTMLEOF
-</table>
-<p style="color:#8b949e;margin-top:3em;font-size:0.85em">Generated by scan.sh v3.0 | Duration: $ELAPSED_FMT</p>
-</body></html>
-HTMLEOF
-    log_success "HTML report generated: $REPORT_HTML"
-fi
+log_ok "HTML report: $REPORT_HTML"
 
-# ==========================================
-# TERMINAL SUMMARY
-# ==========================================
+# ── Log Summary ───────────────────────────────────────────────
+echo "[$(TS)] ============================================" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] $TARGET" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] Nuclei vulns:      $(count_lines "$VULN_DIR/nuclei_vulns.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] Nuclei exposures:  $(count_lines "$VULN_DIR/nuclei_exposures.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] Takeovers:         $(count_lines "$VULN_DIR/nuclei_takeovers.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] JS secrets:        $(count_lines "$VULN_DIR/js_secrets.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] CORS issues:       $(count_lines "$VULN_DIR/cors_findings.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] Open redirects:    $(count_lines "$VULN_DIR/confirmed_redirects.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] SSRF confirmed:    $(count_lines "$VULN_DIR/confirmed_ssrf.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] LFI confirmed:     $(count_lines "$VULN_DIR/confirmed_lfi.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] XSS (Dalfox):      $(count_lines "$VULN_DIR/dalfox_xss.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] 403 bypasses:      $(count_lines "$VULN_DIR/403_bypass.txt")" >> "$LOG_FILE"
+echo "[$(TS)] [SUMMARY] Elapsed:           $ELAPSED_FMT" >> "$LOG_FILE"
+echo "[$(TS)] ============================================" >> "$LOG_FILE"
+
+# ── Terminal Summary ──────────────────────────────────────────
 echo ""
 echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${RED}${BOLD}  SCAN SUMMARY — $target${RESET}"
+echo -e "${RED}${BOLD}  SCAN SUMMARY — $TARGET${RESET}"
 echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  ${BOLD}Nuclei Vulns       :${RESET} $(count_lines "$VULN_DIR/nuclei_vulns.txt")"
-echo -e "  ${BOLD}Nuclei Exposures   :${RESET} $(count_lines "$VULN_DIR/nuclei_exposures.txt")"
-echo -e "  ${BOLD}Subdomain Takeover :${RESET} $(count_lines "$VULN_DIR/nuclei_takeovers.txt")"
-echo -e "  ${BOLD}JS Secrets         :${RESET} $(count_lines "$VULN_DIR/js_secrets.txt")"
-echo -e "  ${BOLD}CORS Issues        :${RESET} $(count_lines "$VULN_DIR/cors_findings.txt")"
-echo -e "  ${BOLD}Open Redirects     :${RESET} $(count_lines "$VULN_DIR/confirmed_redirects.txt")"
-echo -e "  ${BOLD}SSRF Confirmed     :${RESET} $(count_lines "$VULN_DIR/confirmed_ssrf.txt")"
-echo -e "  ${BOLD}LFI Confirmed      :${RESET} $(count_lines "$VULN_DIR/confirmed_lfi.txt")"
-echo -e "  ${BOLD}XSS (Dalfox)       :${RESET} $(count_lines "$VULN_DIR/dalfox_xss.txt")"
-echo -e "  ${BOLD}403 Bypasses       :${RESET} $(count_lines "$VULN_DIR/403_bypass.txt")"
+printf "  %-24s %s\n" "Nuclei vulns:"      "$(count_lines "$VULN_DIR/nuclei_vulns.txt")"
+printf "  %-24s %s\n" "Nuclei exposures:"  "$(count_lines "$VULN_DIR/nuclei_exposures.txt")"
+printf "  %-24s %s\n" "Takeovers:"         "$(count_lines "$VULN_DIR/nuclei_takeovers.txt")"
+printf "  %-24s %s\n" "JS secrets:"        "$(count_lines "$VULN_DIR/js_secrets.txt")"
+printf "  %-24s %s\n" "CORS issues:"       "$(count_lines "$VULN_DIR/cors_findings.txt")"
+printf "  %-24s %s\n" "Open redirects:"    "$(count_lines "$VULN_DIR/confirmed_redirects.txt")"
+printf "  %-24s %s\n" "SSRF confirmed:"    "$(count_lines "$VULN_DIR/confirmed_ssrf.txt")"
+printf "  %-24s %s\n" "LFI confirmed:"     "$(count_lines "$VULN_DIR/confirmed_lfi.txt")"
+printf "  %-24s %s\n" "XSS (Dalfox):"      "$(count_lines "$VULN_DIR/dalfox_xss.txt")"
+printf "  %-24s %s\n" "403 bypasses:"      "$(count_lines "$VULN_DIR/403_bypass.txt")"
 echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  ${BOLD}Output Directory   :${RESET} $VULN_DIR"
-echo -e "  ${BOLD}Report (MD)        :${RESET} $REPORT_MD"
-echo -e "  ${BOLD}Report (HTML)      :${RESET} $REPORT_HTML"
-echo -e "  ${BOLD}Log File           :${RESET} $LOG_FILE"
-echo -e "  ${BOLD}Step State         :${RESET} $STEP_STATE_FILE"
-echo -e "  ${BOLD}Time Elapsed       :${RESET} $ELAPSED_FMT"
+echo -e "  ${BOLD}Vulns dir :${RESET} $VULN_DIR"
+echo -e "  ${BOLD}Logs dir  :${RESET} $LOGS_DIR"
+echo -e "  ${BOLD}Report    :${RESET} $REPORT_HTML"
+echo -e "  ${BOLD}Log       :${RESET} $LOG_FILE"
+echo -e "  ${BOLD}Elapsed   :${RESET} $ELAPSED_FMT"
 echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
-log_success "Scan complete!"
+log_ok "Scan complete!"

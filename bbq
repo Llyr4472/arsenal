@@ -1,34 +1,14 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════
-#  bbq — Bug Bounty Queue  v2.0
-#  Multi-target concurrent background manager for recon.sh + scan.sh
-#
-#  COMMANDS
-#  ────────────────────────────────────────────────────────────
-#  bbq recon  <target> [opts]   Queue recon job
-#  bbq scan   <target> [opts]   Queue vuln scan only
-#  bbq pipe   <target> [opts]   Queue full pipeline (recon → scan)
-#  bbq fresh  <target> [opts]   Wipe + restart pipeline
-#
-#  bbq status / ls              Show all jobs + state
-#  bbq watch  [secs]            Live auto-refreshing board
-#  bbq logs   <target> [type]   Tail live log (recon|scan)
-#  bbq report <target>          Print report summary
-#  bbq stats                    System resources + job overview
-#
-#  bbq pause   <target>         Pause at next checkpoint
-#  bbq unpause <target>         Resume paused job
-#  bbq stop    <target>         Stop cleanly (state preserved)
-#  bbq retry   <target> [opts]  Re-queue (resumes from checkpoint)
-#  bbq remove  <target>         Remove target from queue entirely
-#
-#  bbq config                   Show current settings
-#  bbq config set KEY VALUE      Change a setting
-#
-#  bbq daemon                   Start background daemon
-#  bbq daemon-stop              Stop daemon
-#  bbq daemon-status            Check daemon
+#  bbq — Bug Bounty Queue v4.0
+#  Queue:    pipe | recon | scan
+#  Monitor:  status | watch | logs | stats
+#  Control:  pause | unpause | stop | retry | remove
+#  Rescue:   fix | kill-all
+#  Config:   config [set KEY VAL]
+#  Daemon:   daemon | daemon-stop | daemon-status
 # ══════════════════════════════════════════════════════════════
+set -o noglob
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
 BLUE='\033[0;34m';  CYAN='\033[0;36m';   MAGENTA='\033[0;35m'
@@ -40,9 +20,11 @@ CONFIG_FILE="$QUEUE_DIR/config"
 DAEMON_PID_FILE="$QUEUE_DIR/daemon.pid"
 DAEMON_WORKER="$QUEUE_DIR/daemon_worker.sh"
 DAEMON_LOG="$QUEUE_DIR/daemon.log"
+DAEMON_HEARTBEAT="$QUEUE_DIR/daemon.heartbeat"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECON_SH="$SCRIPT_DIR/recon.sh"
 SCAN_SH="$SCRIPT_DIR/scan.sh"
+BB_DIR="$HOME/bb"
 
 mkdir -p "$QUEUE_DIR"
 touch "$QUEUE_FILE"
@@ -50,383 +32,523 @@ touch "$QUEUE_FILE"
 log_info()    { echo -e "${BLUE}[*]${RESET} $1"; }
 log_success() { echo -e "${GREEN}[+]${RESET} $1"; }
 log_warn()    { echo -e "${YELLOW}[!]${RESET} $1"; }
-log_error()   { echo -e "${RED}[✗]${RESET} $1"; }
+log_error()   { echo -e "${RED}[x]${RESET} $1"; }
 
-print_banner() {
-    echo -e "${RED}${BOLD}"
-    echo "  ██████╗ ██████╗  ██████╗ "
-    echo "  ██╔══██╗██╔══██╗██╔═══██╗"
-    echo "  ██████╔╝██████╔╝██║   ██║"
-    echo "  ██╔══██╗██╔══██╗██║▄▄ ██║"
-    echo "  ██████╔╝██████╔╝╚██████╔╝"
-    echo "  ╚═════╝ ╚═════╝  ╚══▀▀═╝  Bug Bounty Queue v2.0"
-    echo -e "${RESET}"
-}
-
-# ══════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════
-DEFAULT_CONFIG='# bbq configuration — edit or use: bbq config set KEY VALUE
-#
-# Max jobs running simultaneously. Recommended: 1–3 for most VMs.
+# ══ CONFIG ════════════════════════════════════════════════════
+DEFAULT_CONFIG='# bbq config
 MAX_JOBS=2
-#
-# Total thread budget shared across all concurrent jobs.
-# Auto-split: each job gets THREAD_BUDGET / running_jobs threads.
-# E.g. budget=40, 2 jobs → 20 threads each.
+MAX_SCAN_JOBS=1
 THREAD_BUDGET=40
-#
-# Total DNS/HTTP rate budget (req/sec), split the same way.
-RATE_BUDGET=80
-#
-# Hold new spawns when 1-min load > MAX_LOAD_MULT × nproc.
-# E.g. 4 cores × 1.5 → pause spawning at load 6.0
-MAX_LOAD_MULT=1.5
-#
-# Hold new spawns when free RAM < MIN_FREE_RAM_MB.
-# Auto-pause ALL running jobs when RAM < MIN_FREE_RAM_MB / 2.
-MIN_FREE_RAM_MB=512
-#
-# OS nice level for spawned jobs (0=normal, 10=lower, 19=lowest).
-# Keeps your terminal responsive while scans run.
+RATE_BUDGET=60
+LOAD_LIMIT=3
+MIN_RAM_MB=400
 NICE_LEVEL=10
-#
-# Use ionice I/O scheduling if available. 1=yes 0=no
 USE_IONICE=1
 '
 
 init_config() {
-    [ -f "$CONFIG_FILE" ] || { echo "$DEFAULT_CONFIG" > "$CONFIG_FILE"; log_info "Created: $CONFIG_FILE"; }
+    [ -f "$CONFIG_FILE" ] || printf '%s' "$DEFAULT_CONFIG" > "$CONFIG_FILE"
 }
 
 load_config() {
     init_config
-    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE" 2>/dev/null
+    MAX_JOBS="${MAX_JOBS:-2}"
+    MAX_SCAN_JOBS="${MAX_SCAN_JOBS:-1}"
+    THREAD_BUDGET="${THREAD_BUDGET:-40}"
+    RATE_BUDGET="${RATE_BUDGET:-60}"
+    LOAD_LIMIT="${LOAD_LIMIT:-3}"
+    MIN_RAM_MB="${MIN_RAM_MB:-400}"
+    NICE_LEVEL="${NICE_LEVEL:-10}"
+    USE_IONICE="${USE_IONICE:-1}"
 }
 
 config_set() {
-    local key="$1" val="$2"
     init_config
-    if grep -q "^${key}=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$CONFIG_FILE"
+    if grep -q "^${1}=" "$CONFIG_FILE"; then
+        sed -i "s|^${1}=.*|${1}=${2}|" "$CONFIG_FILE"
     else
-        echo "${key}=${val}" >> "$CONFIG_FILE"
+        echo "${1}=${2}" >> "$CONFIG_FILE"
     fi
-    log_success "Set ${BOLD}${key}${RESET} = ${CYAN}${val}${RESET}"
+    log_success "Set ${BOLD}${1}${RESET} = ${CYAN}${2}${RESET}"
 }
 
 cmd_config() {
-    if [ "$1" = "set" ]; then
-        [ -z "$2" ] || [ -z "$3" ] && { log_error "Usage: bbq config set KEY VALUE"; return 1; }
-        config_set "$2" "$3"; return
-    fi
+    [ "$1" = "set" ] && { config_set "$2" "$3"; return; }
     load_config
-    local nproc; nproc=$(nproc 2>/dev/null || echo 4)
-    local lthresh; lthresh=$(echo "$MAX_LOAD_MULT * $nproc" | bc 2>/dev/null || echo "$((nproc*2))")
+    local nproc
+    nproc=$(nproc 2>/dev/null || echo 4)
     echo ""
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo -e "${RED}${BOLD}  BBQ CONFIG${RESET}  ${DIM}$CONFIG_FILE${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "MAX_JOBS"         "$MAX_JOBS"         "concurrent job slots"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "THREAD_BUDGET"    "$THREAD_BUDGET"    "→ $((THREAD_BUDGET/MAX_JOBS)) threads/job at $MAX_JOBS concurrent"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "RATE_BUDGET"      "$RATE_BUDGET"      "→ $((RATE_BUDGET/MAX_JOBS)) rate/job at $MAX_JOBS concurrent"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "MAX_LOAD_MULT"    "$MAX_LOAD_MULT"    "→ hold spawns if load > $lthresh (${nproc} cores)"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "MIN_FREE_RAM_MB"  "$MIN_FREE_RAM_MB"  "hold at <${MIN_FREE_RAM_MB}MB | pause all at <$((MIN_FREE_RAM_MB/2))MB"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "NICE_LEVEL"       "$NICE_LEVEL"       "OS priority (0=normal 10=lower 19=lowest)"
-    printf "  %-22s ${CYAN}${BOLD}%-6s${RESET}  ${DIM}%s${RESET}\n" "USE_IONICE"       "$USE_IONICE"       "I/O scheduling idle class (1=on 0=off)"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "MAX_JOBS"      "$MAX_JOBS"      "total concurrent slots"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "MAX_SCAN_JOBS" "$MAX_SCAN_JOBS" "max parallel scans (keep 1)"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "THREAD_BUDGET" "$THREAD_BUDGET" "-> $((THREAD_BUDGET/MAX_JOBS))/job at $MAX_JOBS concurrent"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "RATE_BUDGET"   "$RATE_BUDGET"   "-> $((RATE_BUDGET/MAX_JOBS))/job at $MAX_JOBS concurrent"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "LOAD_LIMIT"    "$LOAD_LIMIT"    "hold spawns at load >$LOAD_LIMIT ($nproc cores)"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "MIN_RAM_MB"    "$MIN_RAM_MB"    "hold <${MIN_RAM_MB}MB free"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "NICE_LEVEL"    "$NICE_LEVEL"    "0=normal 10=lower 19=lowest"
+    printf "  %-22s ${CYAN}%-6s${RESET}  ${DIM}%s${RESET}\n" "USE_IONICE"    "$USE_IONICE"    "idle I/O class (1=on)"
     echo ""
-    echo -e "  ${DIM}Change: bbq config set MAX_JOBS 3${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "  ${DIM}Example: bbq config set MAX_JOBS 1${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo ""
 }
 
-# ══════════════════════════════════════════
-# RESOURCE HELPERS
-# ══════════════════════════════════════════
-get_load1()     { awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0; }
-get_load5()     { awk '{print $2}' /proc/loadavg 2>/dev/null || echo 0; }
+# ══ RESOURCES ════════════════════════════════════════════════
+get_load_int() { awk '{printf "%d", $1*10}' /proc/loadavg 2>/dev/null || echo 0; }
 get_free_ram()  { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 9999; }
 get_total_ram() { awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0; }
-get_nproc()     { nproc 2>/dev/null || echo 4; }
 
 ok_to_spawn() {
     load_config
-    local load; load=$(get_load1)
-    local free; free=$(get_free_ram)
-    local nproc; nproc=$(get_nproc)
-    local lmax; lmax=$(echo "$MAX_LOAD_MULT * $nproc" | bc 2>/dev/null) || lmax=$(( nproc * 2 ))
-    [ "$free" -lt "$MIN_FREE_RAM_MB" ] && return 1
-    command -v bc &>/dev/null && (( $(echo "$load > $lmax" | bc -l 2>/dev/null || echo 0) )) && return 1
+    [ "$(get_free_ram)" -lt "$MIN_RAM_MB"          ] && return 1
+    [ "$(get_load_int)" -gt $(( LOAD_LIMIT * 10 )) ] && return 1
     return 0
 }
 
-is_critical() {
+resources_str() {
     load_config
-    local free; free=$(get_free_ram)
-    local load; load=$(get_load1)
-    local nproc; nproc=$(get_nproc)
-    [ "$free" -lt $(( MIN_FREE_RAM_MB / 2 )) ] && return 0
-    local lcrit; lcrit=$(echo "$MAX_LOAD_MULT * $nproc * 1.5" | bc 2>/dev/null) || lcrit=$(( nproc * 3 ))
-    command -v bc &>/dev/null && (( $(echo "$load > $lcrit" | bc -l 2>/dev/null || echo 0) )) && return 0
-    return 1
+    local ld li free lx lc rc
+    ld=$(awk '{printf "%.1f", $1}' /proc/loadavg 2>/dev/null || echo "?")
+    li=$(get_load_int)
+    free=$(get_free_ram)
+    lx=$(( LOAD_LIMIT * 10 ))
+    lc="${GREEN}"; rc="${GREEN}"
+    [ "$free" -lt "$MIN_RAM_MB"      ] && rc="${RED}"    || [ "$free" -lt $(( MIN_RAM_MB*2 )) ] && rc="${YELLOW}"
+    [ "$li"   -gt "$lx"              ] && lc="${RED}"    || [ "$li"   -gt $(( lx*7/10 ))     ] && lc="${YELLOW}"
+    echo -e "load: ${lc}${ld}${RESET}/${LOAD_LIMIT}  ram: ${rc}${free}MB${RESET} free"
 }
 
-resources_display() {
-    load_config
-    local load1; load1=$(get_load1)
-    local free; free=$(get_free_ram)
-    local total; total=$(get_total_ram)
-    local nproc; nproc=$(get_nproc)
-    local lmax; lmax=$(echo "$MAX_LOAD_MULT * $nproc" | bc 2>/dev/null || echo "$((nproc*2))")
-    local lc="${GREEN}" rc="${GREEN}"
-    [ "$free" -lt "$MIN_FREE_RAM_MB" ] && rc="${RED}" || [ "$free" -lt $(( MIN_FREE_RAM_MB * 2 )) ] && rc="${YELLOW}"
-    command -v bc &>/dev/null && {
-        (( $(echo "$load1 > $lmax" | bc -l 2>/dev/null || echo 0) )) && lc="${RED}" || \
-        (( $(echo "$load1 > $(echo "$lmax * 0.7" | bc -l)" | bc -l 2>/dev/null || echo 0) )) && lc="${YELLOW}"
-    }
-    echo -e "Load: ${lc}${load1}${RESET}/${lmax} (${nproc}c)  RAM: ${rc}${free}MB${RESET} free / ${total}MB"
-}
-
-# ══════════════════════════════════════════
-# QUEUE OPERATIONS
-# TSV: target | type | status | pid | added_at | opts
-# ══════════════════════════════════════════
-q_field() { grep "^${1}	${2}	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f"$3"; }
-q_status() { q_field "$1" "$2" 3; }
+# ══ QUEUE ════════════════════════════════════════════════════
+# TSV format: target  type  status  pid  added_at  opts
+q_write()  { mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"; }
+q_field()  { grep "^${1}	${2}	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f"$3"; }
 
 q_set() {
-    local target="$1" type="$2" new_status="$3" new_pid="${4:-}"
-    local added_at; added_at=$(grep "^${target}	${type}	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f5)
-    local opts;     opts=$(grep     "^${target}	${type}	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f6)
-    [ -z "$added_at" ] && added_at=$(date '+%Y-%m-%d %H:%M:%S')
-    grep -v "^${target}	${type}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$type" "$new_status" "$new_pid" "$added_at" "$opts" >> "$QUEUE_FILE"
+    local tgt="$1" type="$2" st="$3" pid="${4:-}"
+    local at opts
+    at=$(q_field "$tgt" "$type" 5)
+    [ -z "$at" ] && at=$(date '+%Y-%m-%d %H:%M:%S')
+    opts=$(q_field "$tgt" "$type" 6)
+    grep -v "^${tgt}	${type}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$tgt" "$type" "$st" "$pid" "$at" "$opts" >> "${QUEUE_FILE}.tmp"
+    q_write
 }
 
 q_add() {
-    local target="$1" type="$2" status="${3:-queued}" opts="${4:-}"
-    if grep -q "^${target}	${type}	" "$QUEUE_FILE" 2>/dev/null; then
-        local e; e=$(grep "^${target}	${type}	" "$QUEUE_FILE" | tail -1 | cut -f3)
-        log_warn "'${BOLD}${target}${RESET}' (${type}) already in queue: ${BOLD}$e${RESET}"
-        log_warn "Use 'retry' to re-queue or 'remove' first."
+    local tgt="$1" type="$2" st="${3:-queued}" opts="${4:-}"
+    if grep -q "^${tgt}	${type}	" "$QUEUE_FILE" 2>/dev/null; then
+        local e
+        e=$(q_field "$tgt" "$type" 3)
+        log_warn "'${BOLD}${tgt}${RESET}' ($type) already in queue: ${BOLD}$e${RESET} — use 'retry' or 'remove'"
         return 1
     fi
-    printf '%s\t%s\t%s\t\t%s\t%s\n' "$target" "$type" "$status" "$(date '+%Y-%m-%d %H:%M:%S')" "$opts" >> "$QUEUE_FILE"
-    log_success "Queued [${CYAN}${type}${RESET}]: ${BOLD}$target${RESET}  ${DIM}$opts${RESET}"
+    printf '%s\t%s\t%s\t\t%s\t%s\n' "$tgt" "$type" "$st" "$(date '+%Y-%m-%d %H:%M:%S')" "$opts" >> "$QUEUE_FILE"
+    log_success "Queued [${CYAN}${type}${RESET}]: ${BOLD}$tgt${RESET}  ${DIM}$opts${RESET}"
 }
 
-q_remove_all() { grep -v "^${1}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"; }
+q_remove_all() { grep -v "^${1}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" && q_write; }
 
 q_count() {
-    local s="${1:-}"
-    [ -n "$s" ] && { grep -c "	${s}	" "$QUEUE_FILE" 2>/dev/null || echo 0; return; }
-    grep -c . "$QUEUE_FILE" 2>/dev/null || echo 0
+    local s="${1:-}" n
+    if [ -n "$s" ]; then
+        n=$(grep -c "	${s}	" "$QUEUE_FILE" 2>/dev/null) || n=0
+    else
+        n=$(grep -c '.' "$QUEUE_FILE" 2>/dev/null) || n=0
+    fi
+    echo "${n:-0}"
 }
 
-# ══════════════════════════════════════════
-# DAEMON — writes a worker script to avoid heredoc quoting hell
-# ══════════════════════════════════════════
+# ══ PID / KILL HELPERS ═══════════════════════════════════════
+pid_alive() { [ -n "$1" ] && [ "$1" -gt 0 ] 2>/dev/null && kill -0 "$1" 2>/dev/null; }
+
+get_real_pid() {
+    local p
+    p=$(cat "$BB_DIR/${1}/.scan_pid" 2>/dev/null)
+    [ -n "$p" ] && echo "$p" && return
+    q_field "$1" "$2" 4
+}
+
+get_pgid() {
+    local pgid
+    pgid=$(cat "$BB_DIR/${2}/.scan_pgid" 2>/dev/null)
+    [ -n "$pgid" ] && [ "$pgid" -gt 1 ] 2>/dev/null && echo "$pgid" && return
+    pgid=$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$pgid" ] && [ "$pgid" -gt 1 ] 2>/dev/null && echo "$pgid"
+}
+
+kill_job() {
+    local tgt="$1" rp="$2" sig="${3:-TERM}"
+    local pgid
+    pgid=$(get_pgid "$rp" "$tgt")
+    if [ -n "$pgid" ]; then
+        kill -"$sig" -- -"$pgid" 2>/dev/null
+    else
+        kill -"$sig" "$rp" 2>/dev/null
+    fi
+    # Named sweep for orphaned children
+    pkill -"$sig" -f "nuclei.*${tgt}"    2>/dev/null
+    pkill -"$sig" -f "mantra"            2>/dev/null
+    pkill -"$sig" -f "katana.*${tgt}"    2>/dev/null
+    pkill -"$sig" -f "ffuf.*${tgt}"      2>/dev/null
+    pkill -"$sig" -f "httpx.*${tgt}"     2>/dev/null
+    pkill -"$sig" -f "naabu.*${tgt}"     2>/dev/null
+    pkill -"$sig" -f "dnsx.*${tgt}"      2>/dev/null
+    pkill -"$sig" -f "subfinder.*${tgt}" 2>/dev/null
+}
+
+# ══ RECON COMPLETION CHECK ════════════════════════════════════
+recon_is_done() {
+    local tgt="$1" out="$BB_DIR/${1}"
+    [ "$(q_field "$tgt" "recon" 3)" = "done" ] && return 0
+    [ -f "${out}/final_subdomains.txt" ] && [ -s "${out}/final_subdomains.txt" ] && return 0
+    return 1
+}
+
+# ══ FIX ══════════════════════════════════════════════════════
+cmd_fix() {
+    echo ""
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}  BBQ FIX${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    local fixed=0
+
+    while IFS=$'\t' read -r tgt type status pid at opts; do
+        [ -z "$tgt" ] && continue
+        case "$status" in
+        running)
+            local rpid
+            rpid=$(get_real_pid "$tgt" "$type")
+            if pid_alive "$rpid"; then
+                echo -e "  ${GREEN}OK${RESET}  $tgt [$type] PID=$rpid alive"
+            else
+                kill_job "$tgt" "${rpid:-0}" KILL
+                local sf final steps
+                sf="$BB_DIR/${tgt}/.scan_status"
+                final=$([ -f "$sf" ] && cat "$sf" || echo "stopped")
+                steps=0
+                [ -f "$BB_DIR/${tgt}/.${type}_steps" ] && steps=$(wc -l < "$BB_DIR/${tgt}/.${type}_steps")
+                echo -e "  ${YELLOW}FIX${RESET} $tgt [$type] PID=$rpid dead -> $final ($steps steps done)"
+                q_set "$tgt" "$type" "$final" ""
+                rm -f "$BB_DIR/${tgt}/.sys_paused"
+                (( fixed++ )) || true
+            fi
+            ;;
+        paused)
+            local rpid
+            rpid=$(get_real_pid "$tgt" "$type")
+            if ! pid_alive "$rpid"; then
+                kill_job "$tgt" "${rpid:-0}" KILL
+                echo -e "  ${YELLOW}FIX${RESET} $tgt [$type] paused but PID=$rpid dead -> stopped"
+                q_set "$tgt" "$type" "stopped" ""
+                rm -f "$BB_DIR/${tgt}/.paused" "$BB_DIR/${tgt}/.sys_paused"
+                (( fixed++ )) || true
+            else
+                echo -e "  ${GREEN}OK${RESET}  $tgt [$type] paused, process alive"
+            fi
+            ;;
+        waiting)
+            if recon_is_done "$tgt"; then
+                echo -e "  ${CYAN}FIX${RESET} $tgt [scan] waiting but recon done -> queued"
+                q_set "$tgt" "$type" "queued" ""
+                (( fixed++ )) || true
+            fi
+            ;;
+        esac
+    done < "$QUEUE_FILE"
+
+    if [ -f "$DAEMON_PID_FILE" ] && ! pid_alive "$(cat "$DAEMON_PID_FILE" 2>/dev/null)"; then
+        rm -f "$DAEMON_PID_FILE"
+        echo -e "  ${YELLOW}FIX${RESET} Removed stale daemon PID file"
+        (( fixed++ )) || true
+    fi
+
+    echo ""
+    [ "$fixed" -eq 0 ] \
+        && log_success "Queue is consistent — nothing to fix." \
+        || log_success "$fixed issue(s) fixed."
+    echo ""
+    [ "$fixed" -gt 0 ] && {
+        log_info "Retry stopped jobs: bbq retry <target>"
+        log_info "Restart daemon:     bbq daemon"
+    }
+    echo ""
+}
+
+# ══ KILL-ALL ══════════════════════════════════════════════════
+cmd_kill_all() {
+    echo ""
+    log_warn "Stopping ALL running jobs..."
+    if daemon_running; then
+        local dp
+        dp=$(cat "$DAEMON_PID_FILE")
+        kill "$dp" 2>/dev/null
+        rm -f "$DAEMON_PID_FILE"
+        log_success "Daemon stopped (PID $dp)"
+    fi
+    while IFS=$'\t' read -r tgt type status pid rest; do
+        [ "$status" != "running" ] && continue
+        local rpid
+        rpid=$(get_real_pid "$tgt" "$type")
+        if pid_alive "$rpid"; then
+            kill_job "$tgt" "$rpid" TERM
+            sleep 1
+            pid_alive "$rpid" && kill_job "$tgt" "$rpid" KILL
+        else
+            kill_job "$tgt" "${rpid:-0}" KILL
+        fi
+        log_success "Killed $tgt [$type] PID=${rpid:---}"
+        local wp="$BB_DIR/${tgt}/.watchdog_pid"
+        [ -f "$wp" ] && kill "$(cat "$wp")" 2>/dev/null
+        rm -f "$wp" "$BB_DIR/${tgt}/.paused" "$BB_DIR/${tgt}/.sys_paused"
+        q_set "$tgt" "$type" "stopped" ""
+    done < "$QUEUE_FILE"
+    echo ""
+    log_success "Done. Resume with: bbq retry <target>"
+    echo ""
+}
+
+# ══ DAEMON ════════════════════════════════════════════════════
 daemon_running() {
-    [ -f "$DAEMON_PID_FILE" ] && kill -0 "$(cat "$DAEMON_PID_FILE")" 2>/dev/null
+    [ -f "$DAEMON_PID_FILE" ] && pid_alive "$(cat "$DAEMON_PID_FILE" 2>/dev/null)"
+}
+
+daemon_heartbeat_ok() {
+    [ ! -f "$DAEMON_HEARTBEAT" ] && return 1
+    local now mtime
+    now=$(date +%s)
+    mtime=$(date -r "$DAEMON_HEARTBEAT" +%s 2>/dev/null || echo 0)
+    [ $(( now - mtime )) -lt 60 ]
 }
 
 write_daemon_worker() {
-    # Quoted heredoc = no variable expansion at all (clean bash inside).
-    # __PLACEHOLDERS__ are replaced by sed after the heredoc is written.
     cat > "$DAEMON_WORKER" << 'END_WORKER'
 #!/bin/bash
-# bbq daemon worker — auto-generated by bbq, do not edit manually
+# bbq daemon worker — auto-generated
 
 QUEUE_FILE="__QUEUE_FILE__"
 CONFIG_FILE="__CONFIG_FILE__"
 RECON_SH="__RECON_SH__"
 SCAN_SH="__SCAN_SH__"
+DAEMON_PID_FILE="__DAEMON_PID_FILE__"
+DAEMON_LOG="__DAEMON_LOG__"
+DAEMON_HEARTBEAT="__DAEMON_HEARTBEAT__"
 BB_DIR="$HOME/bb"
 
-echo $$ > "__DAEMON_PID_FILE__"
-exec >> "__DAEMON_LOG__" 2>&1
-echo "[BBQ] Daemon started at $(date)  PID=$$"
+echo $$ > "$DAEMON_PID_FILE"
+exec >> "$DAEMON_LOG" 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Daemon started PID=$$"
 
-# ── Config ────────────────────────────────────────────────────
-load_cfg() { source "$CONFIG_FILE" 2>/dev/null; }
+load_cfg() {
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE" 2>/dev/null
+    MAX_JOBS="${MAX_JOBS:-2}"
+    MAX_SCAN_JOBS="${MAX_SCAN_JOBS:-1}"
+    THREAD_BUDGET="${THREAD_BUDGET:-40}"
+    RATE_BUDGET="${RATE_BUDGET:-60}"
+    LOAD_LIMIT="${LOAD_LIMIT:-3}"
+    MIN_RAM_MB="${MIN_RAM_MB:-400}"
+    NICE_LEVEL="${NICE_LEVEL:-10}"
+    USE_IONICE="${USE_IONICE:-1}"
+}
 
-# ── Resource helpers ──────────────────────────────────────────
-get_load1()    { awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0; }
-get_free_ram() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 9999; }
-get_nproc()    { nproc 2>/dev/null || echo 4; }
+get_load_int() { awk '{printf "%d", $1*10}' /proc/loadavg 2>/dev/null || echo 0; }
+get_free_ram()  { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 9999; }
+pid_alive()     { [ -n "$1" ] && [ "$1" -gt 0 ] 2>/dev/null && kill -0 "$1" 2>/dev/null; }
+
+get_real_pid() {
+    local p
+    p=$(cat "$BB_DIR/${1}/.scan_pid" 2>/dev/null)
+    [ -n "$p" ] && echo "$p" && return
+    grep "^${1}	${2}	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f4
+}
+
+get_pgid() {
+    local pgid
+    pgid=$(cat "$BB_DIR/${2}/.scan_pgid" 2>/dev/null)
+    [ -n "$pgid" ] && [ "$pgid" -gt 1 ] 2>/dev/null && echo "$pgid" && return
+    pgid=$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$pgid" ] && [ "$pgid" -gt 1 ] 2>/dev/null && echo "$pgid"
+}
+
+kill_job() {
+    local tgt="$1" rp="$2" sig="${3:-TERM}"
+    local pgid
+    pgid=$(get_pgid "$rp" "$tgt")
+    if [ -n "$pgid" ]; then
+        kill -"$sig" -- -"$pgid" 2>/dev/null
+    else
+        kill -"$sig" "$rp" 2>/dev/null
+    fi
+    pkill -"$sig" -f "nuclei.*${tgt}"    2>/dev/null
+    pkill -"$sig" -f "mantra"            2>/dev/null
+    pkill -"$sig" -f "katana.*${tgt}"    2>/dev/null
+    pkill -"$sig" -f "ffuf.*${tgt}"      2>/dev/null
+    pkill -"$sig" -f "httpx.*${tgt}"     2>/dev/null
+    pkill -"$sig" -f "naabu.*${tgt}"     2>/dev/null
+    pkill -"$sig" -f "dnsx.*${tgt}"      2>/dev/null
+    pkill -"$sig" -f "subfinder.*${tgt}" 2>/dev/null
+}
 
 ok_to_spawn() {
-    load_cfg
-    local load; load=$(get_load1)
-    local free; free=$(get_free_ram)
-    local nproc; nproc=$(get_nproc)
-    local lmax; lmax=$(echo "$MAX_LOAD_MULT * $nproc" | bc 2>/dev/null) || lmax=$(( nproc * 2 ))
-    [ "$free" -lt "$MIN_FREE_RAM_MB" ] && return 1
-    command -v bc &>/dev/null && (( $(echo "$load > $lmax" | bc -l 2>/dev/null || echo 0) )) && return 1
+    [ "$(get_free_ram)" -lt "$MIN_RAM_MB"          ] && return 1
+    [ "$(get_load_int)" -gt $(( LOAD_LIMIT * 10 )) ] && return 1
     return 0
 }
 
-is_critical() {
-    load_cfg
-    local free; free=$(get_free_ram)
-    local load; load=$(get_load1)
-    local nproc; nproc=$(get_nproc)
-    [ "$free" -lt $(( MIN_FREE_RAM_MB / 2 )) ] && return 0
-    local lc; lc=$(echo "$MAX_LOAD_MULT * $nproc * 1.5" | bc 2>/dev/null) || lc=$(( nproc * 3 ))
-    command -v bc &>/dev/null && (( $(echo "$load > $lc" | bc -l 2>/dev/null || echo 0) )) && return 0
-    return 1
+spawn_prefix() {
+    local p="nice -n ${NICE_LEVEL}"
+    [ "${USE_IONICE}" = "1" ] && command -v ionice &>/dev/null \
+        && p="ionice -c 3 nice -n ${NICE_LEVEL}"
+    echo "$p"
 }
 
-# ── System watchdog ───────────────────────────────────────────
-# Runs in background. Uses .sys_paused marker so we never un-pause
-# a job the user manually paused — only our own auto-pauses.
-(
-    while true; do
-        sleep 30
-        if is_critical; then
-            echo "[SYSWATCH] Resources critical — pausing all running jobs"
-            while IFS=$'\t' read -r t type status pid rest; do
-                [ "$status" != "running" ] && continue
-                pf="$BB_DIR/${t}/.paused"
-                sf="$BB_DIR/${t}/.sys_paused"
-                if [ ! -f "$pf" ]; then
-                    touch "$pf" "$sf"
-                    echo "[SYSWATCH] Paused: $t [$type]"
-                fi
-            done < "$QUEUE_FILE"
-        else
-            for sf in "$BB_DIR"/*/.sys_paused; do
-                [ -f "$sf" ] || continue
-                dir="$(dirname "$sf")"
-                rm -f "$sf" "${dir}/.paused"
-                echo "[SYSWATCH] Resumed: $(basename "$dir")"
-            done
-        fi
-    done
-) &
-echo "[BBQ] System watchdog PID: $!"
-
-# ── Thread/rate budget injection ──────────────────────────────
 inject_resources() {
     local type="$1" running="$2" opts="$3"
-    load_cfg
     local total=$(( running + 1 ))
     [ "$total" -lt 1 ] && total=1
-    local threads=$(( THREAD_BUDGET / total ))
-    local rate=$(( RATE_BUDGET / total ))
-    [ "$threads" -lt 5 ] && threads=5
-    [ "$rate" -lt 10 ] && rate=10
-    echo "[BBQ] Budget split: $total active → ${threads}t ${rate}r each" >&2
-    if ! echo "$opts" | grep -q -- '--threads'; then
-        opts="$opts --threads $threads"
-    fi
-    if [ "$type" = "recon" ] && ! echo "$opts" | grep -q -- '--rate-limit'; then
-        opts="$opts --rate-limit $rate"
-    elif [ "$type" = "scan" ] && ! echo "$opts" | grep -qE -- '--rate[^-]'; then
-        opts="$opts --rate $rate"
+    local t=$(( THREAD_BUDGET / total ))
+    [ "$t" -lt 5  ] && t=5
+    local r=$(( RATE_BUDGET / total ))
+    [ "$r" -lt 10 ] && r=10
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] $total active -> ${t}t ${r}r each" >> "$DAEMON_LOG"
+    echo "$opts" | grep -q -- '--threads'    || opts="$opts --threads $t"
+    if [ "$type" = "recon" ]; then
+        echo "$opts" | grep -q -- '--rate-limit' || opts="$opts --rate-limit $r"
+    else
+        echo "$opts" | grep -qE -- '--rate[^-]'  || opts="$opts --rate $r"
     fi
     echo "$opts"
 }
 
-# ── Spawn prefix (nice + ionice) ──────────────────────────────
-spawn_prefix() {
-    load_cfg
-    local pfx="nice -n ${NICE_LEVEL}"
-    [ "${USE_IONICE}" = "1" ] && command -v ionice &>/dev/null \
-        && pfx="ionice -c 3 nice -n ${NICE_LEVEL}"
-    echo "$pfx"
+recon_is_done() {
+    local out="$BB_DIR/${1}"
+    local rs
+    rs=$(grep "^${1}	recon	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f3)
+    [ "$rs" = "done" ] && return 0
+    [ -f "${out}/final_subdomains.txt" ] && [ -s "${out}/final_subdomains.txt" ] && return 0
+    return 1
 }
 
-# ── Promote waiting scan jobs when their recon finishes ───────
+# Promote scan jobs from waiting -> queued when recon finishes
+# Reads to a temp array first to avoid modifying-while-iterating
 promote_waiting() {
-    while IFS=$'\t' read -r t type status pid added_at opts; do
-        [ "$type" != "scan" ] || [ "$status" != "waiting" ] && continue
-        local rs
-        rs=$(grep "^${t}	recon	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f3)
-        [ "$rs" != "done" ] && continue
+    local to_promote=()
+    while IFS=$'\t' read -r t type status pid at opts; do
+        [ "$type" = "scan" ] && [ "$status" = "waiting" ] || continue
+        recon_is_done "$t" || continue
+        to_promote+=("$t	$opts")
+    done < "$QUEUE_FILE"
+
+    for entry in "${to_promote[@]}"; do
+        local t opts
+        t="${entry%%	*}"
+        opts="${entry#*	}"
         grep -v "^${t}	scan	waiting	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
             && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
         printf '%s\tscan\tqueued\t\t%s\t%s\n' \
             "$t" "$(date '+%Y-%m-%d %H:%M:%S')" "$opts" >> "$QUEUE_FILE"
-        echo "[BBQ] Promoted $t [scan] waiting → queued"
-    done < "$QUEUE_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Promoted $t [scan] -> queued"
+    done
 }
 
-# ── Clean up jobs whose processes have died ───────────────────
+# Clean up dead running jobs — reads snapshot to avoid loop/modify race
 cleanup_dead() {
-    while IFS=$'\t' read -r t type status pid added_at opts; do
-        [ "$status" != "running" ] && continue
-        [ -z "$pid" ] && continue
-        kill -0 "$pid" 2>/dev/null && continue
-        local sf="$BB_DIR/${t}/.scan_status"
-        local final; final=$([ -f "$sf" ] && cat "$sf" || echo "failed")
-        echo "[BBQ] Dead process: $t [$type] PID=$pid → $final"
-        grep -v "^${t}	${type}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
+    local snapshot
+    snapshot=$(grep $'\trunning\t' "$QUEUE_FILE" 2>/dev/null) || return 0
+    [ -z "$snapshot" ] && return 0
+
+    while IFS=$'\t' read -r t type status pid at opts; do
+        local rpid
+        rpid=$(get_real_pid "$t" "$type")
+        [ -z "$rpid" ] && rpid="$pid"
+        pid_alive "$rpid" && continue
+
+        kill_job "$t" "${rpid:-0}" KILL
+
+        local sf final steps
+        sf="$BB_DIR/${t}/.scan_status"
+        final=$([ -f "$sf" ] && cat "$sf" || echo "failed")
+        steps=0
+        [ -f "$BB_DIR/${t}/.${type}_steps" ] && steps=$(wc -l < "$BB_DIR/${t}/.${type}_steps" 2>/dev/null)
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Dead: $t [$type] PID=$rpid -> $final ($steps steps)"
+
+        grep -v "^${t}	${type}	running	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
             && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
         printf '%s\t%s\t%s\t\t%s\t%s\n' \
             "$t" "$type" "$final" "$(date '+%Y-%m-%d %H:%M:%S')" "$opts" >> "$QUEUE_FILE"
+
+        rm -f "$BB_DIR/${t}/.sys_paused"
         [ "$type" = "recon" ] && [ "$final" = "done" ] && promote_waiting
-    done < "$QUEUE_FILE"
+    done <<< "$snapshot"
 }
 
-# ══ Main loop ═════════════════════════════════════════════════
+# Main loop
 while true; do
+    touch "$DAEMON_HEARTBEAT"
+    load_cfg
     cleanup_dead
     promote_waiting
-    load_cfg
 
-    RUNNING=$(grep -c "	running	" "$QUEUE_FILE" 2>/dev/null || echo 0)
+    local_running=$(grep -c $'\trunning\t' "$QUEUE_FILE" 2>/dev/null) || local_running=0
+    local_running_scans=$(grep -c $'\tscan\trunning\t' "$QUEUE_FILE" 2>/dev/null) || local_running_scans=0
 
-    if [ "$RUNNING" -lt "$MAX_JOBS" ]; then
-
+    if [ "$local_running" -lt "$MAX_JOBS" ]; then
         if ! ok_to_spawn; then
-            load1=$(get_load1); free=$(get_free_ram)
-            echo "[BBQ] Resource gate: holding spawns (load=$load1 ram=${free}MB free)"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Resource gate: load=$(get_load_int) ram=$(get_free_ram)MB — holding"
             sleep 15
             continue
         fi
 
-        NEXT_LINE=$(grep -m1 $'	queued	' "$QUEUE_FILE" 2>/dev/null)
-        if [ -n "$NEXT_LINE" ]; then
-            T=$(    echo "$NEXT_LINE" | cut -f1)
-            TYPE=$( echo "$NEXT_LINE" | cut -f2)
-            OPTS=$( echo "$NEXT_LINE" | cut -f6)
+        # Find next queued job
+        NEXT_T=""
+        NEXT_TYPE=""
+        NEXT_OPTS=""
+        while IFS=$'\t' read -r t type status pid at opts; do
+            [ "$status" != "queued" ] && continue
+            [ "$type" = "scan" ] && [ "$local_running_scans" -ge "$MAX_SCAN_JOBS" ] && continue
+            NEXT_T="$t"
+            NEXT_TYPE="$type"
+            NEXT_OPTS="$opts"
+            break
+        done < "$QUEUE_FILE"
 
-            case "$TYPE" in
+        if [ -n "$NEXT_T" ]; then
+            case "$NEXT_TYPE" in
                 recon) SCRIPT="$RECON_SH" ;;
                 scan)  SCRIPT="$SCAN_SH"  ;;
                 *)
-                    echo "[BBQ] Unknown type '$TYPE' — failing $T"
-                    grep -v "^${T}	${TYPE}	queued	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Unknown type '$NEXT_TYPE' for $NEXT_T — failing"
+                    grep -v "^${NEXT_T}	${NEXT_TYPE}	queued	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
                         && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
                     printf '%s\t%s\tfailed\t\t%s\t%s\n' \
-                        "$T" "$TYPE" "$(date '+%Y-%m-%d %H:%M:%S')" "$OPTS" >> "$QUEUE_FILE"
+                        "$NEXT_T" "$NEXT_TYPE" "$(date '+%Y-%m-%d %H:%M:%S')" "$NEXT_OPTS" >> "$QUEUE_FILE"
                     continue
                     ;;
             esac
 
-            # Inject thread/rate allocation for this spawn
-            FINAL_OPTS=$(inject_resources "$TYPE" "$RUNNING" "$OPTS")
+            FINAL_OPTS=$(inject_resources "$NEXT_TYPE" "$local_running" "$NEXT_OPTS")
             PREFIX=$(spawn_prefix)
-            LOG="$BB_DIR/${T}/${TYPE}.log"
-            mkdir -p "$BB_DIR/${T}"
+            LOG="$BB_DIR/${NEXT_T}/${NEXT_TYPE}.log"
+            mkdir -p "$BB_DIR/${NEXT_T}"
 
-            echo "[BBQ] Spawning: $T [$TYPE]  slot=$((RUNNING+1))/$MAX_JOBS  opts='$FINAL_OPTS'"
-            # setsid: job survives if daemon stops; $PREFIX: nice+ionice
-            # shellcheck disable=SC2086
-            setsid $PREFIX bash "$SCRIPT" "$T" $FINAL_OPTS >> "$LOG" 2>&1 &
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] Spawning $NEXT_T [$NEXT_TYPE] slot=$((local_running+1))/$MAX_JOBS opts='$FINAL_OPTS'"
+
+            setsid $PREFIX bash "$SCRIPT" "$NEXT_T" $FINAL_OPTS >> "$LOG" 2>&1 &
             SCAN_PID=$!
-            echo "[BBQ] PID=$SCAN_PID  prefix='$PREFIX'"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BBQ] PID=$SCAN_PID log=$LOG"
 
-            # Mark running in queue
-            grep -v "^${T}	${TYPE}	queued	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
+            grep -v "^${NEXT_T}	${NEXT_TYPE}	queued	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" \
                 && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
             printf '%s\t%s\trunning\t%s\t%s\t%s\n' \
-                "$T" "$TYPE" "$SCAN_PID" "$(date '+%Y-%m-%d %H:%M:%S')" "$OPTS" >> "$QUEUE_FILE"
+                "$NEXT_T" "$NEXT_TYPE" "$SCAN_PID" \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$NEXT_OPTS" >> "$QUEUE_FILE"
 
-            sleep 2    # small gap — prevents thundering herd when multiple slots are free
-            continue   # loop immediately to try filling the next slot
+            sleep 3
+            continue
         fi
     fi
 
@@ -434,7 +556,6 @@ while true; do
 done
 END_WORKER
 
-    # Substitute __PLACEHOLDERS__ with real paths baked in at daemon-start time
     sed -i \
         -e "s|__QUEUE_FILE__|${QUEUE_FILE}|g" \
         -e "s|__CONFIG_FILE__|${CONFIG_FILE}|g" \
@@ -442,8 +563,8 @@ END_WORKER
         -e "s|__SCAN_SH__|${SCAN_SH}|g" \
         -e "s|__DAEMON_PID_FILE__|${DAEMON_PID_FILE}|g" \
         -e "s|__DAEMON_LOG__|${DAEMON_LOG}|g" \
+        -e "s|__DAEMON_HEARTBEAT__|${DAEMON_HEARTBEAT}|g" \
         "$DAEMON_WORKER"
-
     chmod +x "$DAEMON_WORKER"
 }
 
@@ -452,417 +573,456 @@ daemon_start() {
         log_info "Daemon already running (PID: $(cat "$DAEMON_PID_FILE"))"
         return
     fi
-    init_config; load_config
-    log_info "Starting bbq daemon (MAX_JOBS=${MAX_JOBS}, THREAD_BUDGET=${THREAD_BUDGET}, NICE=${NICE_LEVEL})..."
+
+    local stale
+    stale=$(grep -c $'\trunning\t' "$QUEUE_FILE" 2>/dev/null) || stale=0
+    [ "$stale" -gt 0 ] && {
+        log_warn "$stale stale 'running' entries — running fix first..."
+        cmd_fix
+    }
+
+    init_config
+    load_config
+    log_info "Starting daemon (MAX_JOBS=${MAX_JOBS} MAX_SCAN_JOBS=${MAX_SCAN_JOBS} NICE=${NICE_LEVEL})..."
     write_daemon_worker
     ( setsid bash "$DAEMON_WORKER" & disown )
     sleep 1
     if daemon_running; then
         log_success "Daemon started (PID: $(cat "$DAEMON_PID_FILE"))"
-        log_info "Concurrent slots: ${BOLD}${MAX_JOBS}${RESET}  Thread budget: ${BOLD}${THREAD_BUDGET}${RESET}  Nice: ${BOLD}${NICE_LEVEL}${RESET}"
-        log_info "To adjust: bbq config set MAX_JOBS 3"
     else
         log_error "Daemon failed to start — check: $DAEMON_LOG"
     fi
 }
 
 daemon_stop() {
-    if ! daemon_running; then log_warn "Daemon is not running."; return; fi
-    local pid; pid=$(cat "$DAEMON_PID_FILE")
-    kill "$pid" 2>/dev/null; rm -f "$DAEMON_PID_FILE"
-    log_success "Daemon stopped (was PID $pid)"
-    log_warn "Running scans continue independently in the background."
+    if ! daemon_running; then
+        log_warn "Daemon not running."
+        return
+    fi
+    local p
+    p=$(cat "$DAEMON_PID_FILE")
+    kill "$p" 2>/dev/null
+    rm -f "$DAEMON_PID_FILE"
+    log_success "Daemon stopped (was PID $p)"
+    log_info "Running scans continue independently."
 }
 
 daemon_status_cmd() {
     if daemon_running; then
         load_config
         log_success "Daemon RUNNING (PID: $(cat "$DAEMON_PID_FILE"))"
-        log_info "MAX_JOBS=${MAX_JOBS}  THREAD_BUDGET=${THREAD_BUDGET}  NICE=${NICE_LEVEL}"
+        if daemon_heartbeat_ok; then
+            local age
+            age=$(( $(date +%s) - $(date -r "$DAEMON_HEARTBEAT" +%s 2>/dev/null || echo 0) ))
+            log_info "Heartbeat: ${age}s ago — responsive"
+        else
+            log_warn "Heartbeat stale — daemon may be hung"
+            log_warn "Run: bbq kill-all && bbq daemon"
+        fi
+        log_info "MAX_JOBS=${MAX_JOBS}  MAX_SCAN_JOBS=${MAX_SCAN_JOBS}  NICE=${NICE_LEVEL}"
     else
         log_warn "Daemon NOT running."
-        local n; n=$(q_count "queued")
-        [ "$n" -gt 0 ] && log_warn "$n job(s) queued but daemon is stopped → bbq daemon"
+        local n
+        n=$(q_count "queued")
+        [ "$n" -gt 0 ] && log_warn "$n queued — run: bbq daemon"
     fi
 }
 
-# ══════════════════════════════════════════
-# STATUS
-# ══════════════════════════════════════════
-status_color() {
+# ══ STATUS ════════════════════════════════════════════════════
+sc() {
     case "$1" in
-        running)  echo "${GREEN}"   ;; queued)  echo "${CYAN}"    ;;
-        waiting)  echo "${BLUE}"    ;; done)    echo "${DIM}"     ;;
-        failed)   echo "${RED}"     ;; stopped) echo "${YELLOW}"  ;;
-        paused)   echo "${MAGENTA}" ;; *)       echo "${RESET}"   ;;
+        running) echo "${GREEN}"   ;; queued)  echo "${CYAN}"    ;;
+        waiting) echo "${BLUE}"    ;; done)    echo "${DIM}"     ;;
+        failed)  echo "${RED}"     ;; stopped) echo "${YELLOW}"  ;;
+        paused)  echo "${MAGENTA}" ;; *)       echo "${RESET}"   ;;
     esac
 }
-status_icon() {
+si() {
     case "$1" in
-        running) echo "▶" ;; queued)  echo "⏳" ;; waiting) echo "⋯" ;;
-        done)    echo "✔" ;; failed)  echo "✖"  ;; stopped) echo "■" ;;
-        paused)  echo "⏸" ;; *)      echo "?"  ;;
+        running) echo ">>" ;; queued)  echo "::" ;; waiting) echo ".." ;;
+        done)    echo "OK" ;; failed)  echo "!!" ;; stopped) echo "--" ;;
+        paused)  echo "||" ;; *)       echo "?"  ;;
     esac
 }
-step_progress() {
-    local f total
-    [ "$2" = "recon" ] && f="$HOME/bb/${1}/.recon_steps" && total=7 \
-                       || f="$HOME/bb/${1}/.scan_steps"  && total=12
+
+step_prog() {
+    local f t
+    if [ "$2" = "recon" ]; then
+        f="$BB_DIR/${1}/.recon_steps"
+        t=7
+    else
+        f="$BB_DIR/${1}/.scan_steps"
+        t=12
+    fi
     [ ! -f "$f" ] && return
-    local n; n=$(wc -l < "$f")
-    local last; last=$(tail -1 "$f" 2>/dev/null | sed 's/phase_[0-9]*_//' | tr '_' ' ')
-    echo "${n}/${total} – ${last}"
+    local n last
+    n=$(wc -l < "$f")
+    last=$(tail -1 "$f" 2>/dev/null | sed 's/phase_[0-9]*_//' | tr '_' ' ')
+    echo "${n}/${t} — ${last}"
 }
 
 cmd_status() {
     load_config
     echo ""
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${RED}${BOLD}  🔴 BBQ STATUS BOARD${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}  BBQ STATUS${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     printf "  Daemon : "
     if daemon_running; then
-        echo -e "${GREEN}${BOLD}RUNNING${RESET} (PID: $(cat "$DAEMON_PID_FILE"))  slots:${MAX_JOBS}  budget:${THREAD_BUDGET}t/${RATE_BUDGET}r  nice:${NICE_LEVEL}"
+        local hb=""
+        if daemon_heartbeat_ok; then
+            hb="  heartbeat OK"
+        else
+            hb="  ${RED}[STALE HEARTBEAT — run: bbq kill-all]${RESET}"
+        fi
+        echo -e "${GREEN}${BOLD}RUNNING${RESET} PID=$(cat "$DAEMON_PID_FILE")${hb}"
+        echo -e "           slots: ${MAX_JOBS} (max ${MAX_SCAN_JOBS} scan)  budget: ${THREAD_BUDGET}t/${RATE_BUDGET}r"
     else
         echo -e "${RED}STOPPED${RESET}  ← run: bbq daemon"
     fi
-    printf "  System : "; resources_display
+    printf "  System : "; resources_str
     echo ""
-    printf "  %-28s %-6s %-14s %-8s %s\n" "TARGET" "TYPE" "STATUS" "PID" "PROGRESS"
-    echo -e "  ${DIM}$(printf '%.0s─' {1..76})${RESET}"
+    printf "  %-28s %-6s %-12s %-8s %s\n" "TARGET" "TYPE" "STATUS" "PID" "PROGRESS"
+    echo -e "  ${DIM}$(printf '%.0s─' {1..74})${RESET}"
 
     if [ ! -s "$QUEUE_FILE" ]; then
-        echo -e "  ${DIM}(no jobs queued)${RESET}"
+        echo -e "  ${DIM}(queue is empty)${RESET}"
     else
-        while IFS=$'\t' read -r target type status pid added_at opts; do
-            [ -z "$target" ] && continue
-            [ "$status" = "running" ] && [ -f "$HOME/bb/${target}/.paused" ] && status="paused"
-            local color; color=$(status_color "$status")
-            local icon;  icon=$(status_icon  "$status")
-            local prog;  prog=$(step_progress "$target" "$type")
-            local sflag=""; [ -f "$HOME/bb/${target}/.sys_paused" ] && sflag=" ${DIM}[sys]${RESET}"
-            printf "  %-28s ${CYAN}%-6s${RESET} ${color}%-14s${RESET} %-8s %s\n" \
-                "$target" "$type" "${icon} ${status}${sflag}" "${pid:---}" "$prog"
-            [ -n "$opts" ] && printf "  %-28s ${DIM}opts: %s${RESET}\n" "" "$opts"
+        while IFS=$'\t' read -r tgt type status pid at opts; do
+            [ -z "$tgt" ] && continue
+            [ "$status" = "running" ] && [ -f "$BB_DIR/${tgt}/.paused" ] && status="paused"
+            local c i prog dp
+            c=$(sc "$status")
+            i=$(si "$status")
+            prog=$(step_prog "$tgt" "$type")
+            dp=$(get_real_pid "$tgt" "$type")
+            [ "$status" != "running" ] && [ "$status" != "paused" ] && dp="${pid:---}"
+            printf "  %-28s ${CYAN}%-6s${RESET} ${c}%-12s${RESET} %-8s %s\n" \
+                "$tgt" "$type" "${i} ${status}" "${dp:---}" "$prog"
+            [ -n "$opts" ] && printf "  %-28s ${DIM}%s${RESET}\n" "" "$opts"
         done < "$QUEUE_FILE"
     fi
 
     echo ""
-    local running; running=$(q_count "running")
-    echo -e "  ${BOLD}Jobs:${RESET} $(q_count queued) queued  ${running} running  $(q_count done) done  $(q_count failed) failed  $(q_count waiting) waiting"
-    echo -e "  ${BOLD}Slots:${RESET} ${running}/${MAX_JOBS} in use  $(( MAX_JOBS - running )) free"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    local r mj
+    r=$(q_count "running")
+    mj="${MAX_JOBS:-2}"
+    echo -e "  ${BOLD}Jobs :${RESET} $(q_count queued) queued  $r running  $(q_count done) done  $(q_count failed) failed  $(q_count stopped) stopped  $(q_count waiting) waiting"
+    echo -e "  ${BOLD}Slots:${RESET} $r/${mj} in use  $(( mj - r )) free"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo ""
-    echo -e "  ${DIM}bbq watch  |  bbq stats  |  bbq logs <target>  |  bbq config${RESET}"
+    echo -e "  ${DIM}bbq watch | stats | fix | kill-all | logs <target> | config${RESET}"
     echo ""
 }
 
 cmd_watch() {
     local i="${1:-3}"
-    echo -e "${DIM}Live board every ${i}s — Ctrl+C to exit${RESET}"; sleep 1
-    while true; do clear; cmd_status; echo -e "  ${DIM}[$(date '+%H:%M:%S')]  Ctrl+C to exit${RESET}"; sleep "$i"; done
+    echo -e "${DIM}Refreshing every ${i}s — Ctrl+C to exit${RESET}"
+    sleep 1
+    while true; do
+        clear
+        cmd_status
+        echo -e "  ${DIM}[$(date '+%H:%M:%S')] Ctrl+C to exit${RESET}"
+        sleep "$i"
+    done
 }
 
-# ══════════════════════════════════════════
-# STATS
-# ══════════════════════════════════════════
 cmd_stats() {
     load_config
-    local nproc; nproc=$(get_nproc)
-    local load1; load1=$(get_load1)
-    local load5; load5=$(get_load5)
-    local free;  free=$(get_free_ram)
-    local total; total=$(get_total_ram)
-    local used=$(( total - free ))
-    local pct=$(( used * 100 / (total + 1) ))
-    local lmax; lmax=$(echo "$MAX_LOAD_MULT * $nproc" | bc 2>/dev/null || echo "$((nproc*2))")
-
+    local nproc ld li free total pct lx lc rc
+    nproc=$(nproc 2>/dev/null || echo 4)
+    ld=$(awk '{printf "%.1f %.1f", $1, $2}' /proc/loadavg 2>/dev/null || echo "? ?")
+    li=$(get_load_int)
+    free=$(get_free_ram)
+    total=$(get_total_ram)
+    pct=$(( (total-free)*100/(total+1) ))
+    lx=$(( LOAD_LIMIT*10 ))
+    lc="${GREEN}"; rc="${GREEN}"
+    [ "$free" -lt "$MIN_RAM_MB"   ] && rc="${RED}"   || [ "$free" -lt $(( MIN_RAM_MB*2 )) ] && rc="${YELLOW}"
+    [ "$li"   -gt "$lx"           ] && lc="${RED}"   || [ "$li"   -gt $(( lx*7/10 ))     ] && lc="${YELLOW}"
     echo ""
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${RED}${BOLD}  BBQ SYSTEM STATS${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-
-    local lc="${GREEN}"
-    command -v bc &>/dev/null && {
-        (( $(echo "$load1 > $lmax" | bc -l 2>/dev/null || echo 0) ))           && lc="${RED}"
-        (( $(echo "$load1 > $(echo "$lmax * 0.7" | bc -l)" | bc -l 2>/dev/null || echo 0) )) && lc="${YELLOW}"
-    }
-    local rc="${GREEN}"
-    [ "$free" -lt "$MIN_FREE_RAM_MB" ] && rc="${RED}" || [ "$free" -lt $(( MIN_FREE_RAM_MB * 2 )) ] && rc="${YELLOW}"
-
-    echo -e "  ${BOLD}CPU       :${RESET} $nproc cores"
-    echo -e "  ${BOLD}Load      :${RESET} ${lc}${load1}${RESET} (1m)  ${load5} (5m)  — gate at ${lmax}"
-    echo -e "  ${BOLD}RAM       :${RESET} ${rc}${free}MB free${RESET} / ${total}MB total  (${pct}% used)"
-    echo -e "  ${BOLD}RAM gates :${RESET} hold spawns <${MIN_FREE_RAM_MB}MB  |  pause all <$((MIN_FREE_RAM_MB/2))MB"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}  BBQ STATS${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "  ${BOLD}CPU     :${RESET} $nproc cores"
+    echo -e "  ${BOLD}Load    :${RESET} ${lc}${ld}${RESET} (1m 5m)  gate:>$LOAD_LIMIT"
+    echo -e "  ${BOLD}RAM     :${RESET} ${rc}${free}MB free${RESET} / ${total}MB (${pct}% used)"
+    echo -e "  ${BOLD}Gate    :${RESET} hold <${MIN_RAM_MB}MB free"
     echo ""
-    local running; running=$(q_count "running")
-    echo -e "  ${BOLD}Job slots :${RESET} ${running}/${MAX_JOBS} in use"
-    echo -e "  ${BOLD}Threads   :${RESET} budget=${THREAD_BUDGET} ÷ max_jobs=${MAX_JOBS} → up to $((THREAD_BUDGET/MAX_JOBS)) per job"
-    echo -e "  ${BOLD}Rate      :${RESET} budget=${RATE_BUDGET} ÷ max_jobs=${MAX_JOBS} → up to $((RATE_BUDGET/MAX_JOBS)) per job"
-    echo -e "  ${BOLD}Nice      :${RESET} ${NICE_LEVEL}  ionice: ${USE_IONICE}"
-    echo -e "  ${BOLD}ionice ok :${RESET} $(command -v ionice &>/dev/null && echo yes || echo "not installed")"
-
-    local rjobs; rjobs=$(grep $'\trunning\t' "$QUEUE_FILE" 2>/dev/null)
-    if [ -n "$rjobs" ]; then
+    local r
+    r=$(q_count "running")
+    echo -e "  ${BOLD}Slots   :${RESET} $r/${MAX_JOBS} in use (max ${MAX_SCAN_JOBS} scan)"
+    echo -e "  ${BOLD}Threads :${RESET} ${THREAD_BUDGET} / ${MAX_JOBS} = $((THREAD_BUDGET/MAX_JOBS)) per job"
+    echo -e "  ${BOLD}Rate    :${RESET} ${RATE_BUDGET} / ${MAX_JOBS} = $((RATE_BUDGET/MAX_JOBS)) per job"
+    echo -e "  ${BOLD}Nice    :${RESET} $NICE_LEVEL  ionice: $USE_IONICE"
+    local rj
+    rj=$(grep $'\trunning\t' "$QUEUE_FILE" 2>/dev/null)
+    if [ -n "$rj" ]; then
         echo ""
         echo -e "  ${BOLD}Running:${RESET}"
         while IFS=$'\t' read -r t type status pid rest; do
-            local rpid; rpid=$(cat "$HOME/bb/${t}/.scan_pid" 2>/dev/null || echo "$pid")
-            local cm=""
-            [ -n "$rpid" ] && command -v ps &>/dev/null && \
-                cm=$(ps -p "$rpid" -o %cpu,%mem --no-headers 2>/dev/null | xargs) && \
-                [ -n "$cm" ] && cm="  cpu/mem: ${cm}%"
-            local prog; prog=$(step_progress "$t" "$type")
-            echo -e "    ${CYAN}${t}${RESET} [${type}]  PID=${rpid}${cm}"
-            [ -n "$prog" ] && echo -e "      ${DIM}${prog}${RESET}"
-        done <<< "$rjobs"
+            local rp alive cm
+            rp=$(get_real_pid "$t" "$type")
+            if pid_alive "$rp"; then
+                alive="${GREEN}alive${RESET}"
+            else
+                alive="${RED}DEAD (run: bbq fix)${RESET}"
+            fi
+            cm=""
+            [ -n "$rp" ] && cm="  $(ps -p "$rp" -o %cpu,%mem --no-headers 2>/dev/null | xargs)%"
+            echo -e "    ${CYAN}${t}${RESET} [$type]  PID=$rp  $alive$cm"
+            local p
+            p=$(step_prog "$t" "$type")
+            [ -n "$p" ] && echo -e "    ${DIM}$p${RESET}"
+        done <<< "$rj"
     fi
-
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo ""
 }
 
-# ══════════════════════════════════════════
-# LOGS + REPORT
-# ══════════════════════════════════════════
 cmd_logs() {
-    local target="$1" type="${2:-}"
+    local tgt="$1" type="${2:-}"
     if [ -z "$type" ]; then
-        grep -q "^${target}	recon	running" "$QUEUE_FILE" 2>/dev/null && type="recon" || \
-        grep -q "^${target}	scan	running"  "$QUEUE_FILE" 2>/dev/null && type="scan"  || {
-            echo -e "${BOLD}Logs for ${CYAN}${target}${RESET}:"
-            [ -f "$HOME/bb/${target}/recon.log" ] && echo "  recon → $HOME/bb/${target}/recon.log"
-            [ -f "$HOME/bb/${target}/scan.log"  ] && echo "  scan  → $HOME/bb/${target}/scan.log"
-            echo "  Usage: bbq logs $target [recon|scan]"; return; }
+        # Auto-detect which log to show: prefer running, else show both
+        if grep -q "^${tgt}	recon	running" "$QUEUE_FILE" 2>/dev/null; then
+            type="recon"
+        elif grep -q "^${tgt}	scan	running" "$QUEUE_FILE" 2>/dev/null; then
+            type="scan"
+        else
+            echo -e "${BOLD}Logs for ${CYAN}${tgt}${RESET}:"
+            [ -f "$BB_DIR/${tgt}/recon.log" ] && echo "  recon → $BB_DIR/${tgt}/recon.log"
+            [ -f "$BB_DIR/${tgt}/scan.log"  ] && echo "  scan  → $BB_DIR/${tgt}/scan.log"
+            echo "  Usage: bbq logs $tgt [recon|scan]"
+            return
+        fi
     fi
-    local f="$HOME/bb/${target}/${type}.log"
+    local f="$BB_DIR/${tgt}/${type}.log"
     [ ! -f "$f" ] && { log_warn "Not found: $f"; return 1; }
-    echo -e "${BOLD}Tailing ${CYAN}${type}${RESET} log for ${BOLD}${target}${RESET} — Ctrl+C to stop"
-    echo -e "${DIM}$f${RESET}\n"; tail -f "$f"
+    echo -e "${BOLD}Tailing ${CYAN}${type}${RESET} log for ${BOLD}${tgt}${RESET} — Ctrl+C to stop"
+    echo -e "${DIM}$f${RESET}\n"
+    tail -f "$f"
 }
 
 cmd_report() {
-    local target="$1" out="$HOME/bb/${1}"
+    local tgt="$1" out="$BB_DIR/${1}"
     echo ""
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "${RED}${BOLD}  REPORT — ${target}${RESET}"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo -e "\n  ${CYAN}${BOLD}[ RECON ]${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${RED}${BOLD}  REPORT — ${tgt}${RESET}"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "\n  ${CYAN}${BOLD}RECON${RESET}"
     for e in "passive_raw.txt:Passive subs" "brute_subs.txt:Bruteforce" \
              "final_subdomains.txt:Final subdomains" "web_alive.txt:Live web servers" \
              "clean_urls.txt:Unique URLs" "final_params.txt:URLs w/ params"; do
-        local f="${e%%:*}" l="${e##*:}"
-        [ -f "${out}/${f}" ] && printf "  %-28s ${BOLD}%s${RESET}\n" "$l" "$(wc -l < "${out}/${f}")"
+        [ -f "${out}/${e%%:*}" ] && \
+            printf "  %-28s ${BOLD}%s${RESET}\n" "${e##*:}" "$(wc -l < "${out}/${e%%:*}")"
     done
-    echo -e "\n  ${RED}${BOLD}[ VULN SCAN ]${RESET}"
+    echo -e "\n  ${RED}${BOLD}VULN SCAN${RESET}"
     local vd="${out}/vulns"
     if [ -d "$vd" ]; then
-        for e in "nuclei_vulns.txt:Nuclei vulns:h" "nuclei_exposures.txt:Nuclei exposures:m" \
-                 "nuclei_takeovers.txt:Subdomain takeovers:c" "js_secrets.txt:JS secrets:h" \
-                 "cors_findings.txt:CORS issues:m" "confirmed_redirects.txt:Open redirects:m" \
-                 "confirmed_ssrf.txt:SSRF confirmed:h" "confirmed_lfi.txt:LFI confirmed:h" \
-                 "dalfox_xss.txt:XSS (Dalfox):h" "403_bypass.txt:403 bypasses:m"; do
-            IFS=: read -r f l sev <<< "$e"
-            [ ! -f "${vd}/${f}" ] && continue
-            local n; n=$(wc -l < "${vd}/${f}")
-            local c="${RESET}"
-            [ "$n" -gt 0 ] && case "$sev" in c) c="${RED}${BOLD}";; h) c="${RED}";; m) c="${YELLOW}";; esac
+        for e in "nuclei_vulns.txt:Nuclei vulns:h" "nuclei_takeovers.txt:Takeovers:c" \
+                 "js_secrets.txt:JS secrets:h" "cors_findings.txt:CORS:m" \
+                 "confirmed_ssrf.txt:SSRF:h" "confirmed_lfi.txt:LFI:h" \
+                 "dalfox_xss.txt:XSS:h" "403_bypass.txt:403 bypass:m"; do
+            IFS=: read -r f l sv <<< "$e"
+            [ -f "${vd}/${f}" ] || continue
+            local n c
+            n=$(wc -l < "${vd}/${f}")
+            c="${RESET}"
+            [ "$n" -gt 0 ] && case "$sv" in
+                c) c="${RED}${BOLD}" ;; h) c="${RED}" ;; m) c="${YELLOW}" ;;
+            esac
             printf "  %-28s ${c}${BOLD}%s${RESET}\n" "$l" "$n"
         done
-    else echo -e "  ${DIM}Vuln scan not yet run.${RESET}"; fi
+    else
+        echo -e "  ${DIM}Vuln scan not yet run.${RESET}"
+    fi
     echo ""
-    local rmd="${out}/report/report.md" rhtml="${out}/report/report.html"
-    [ -f "$rmd"   ] && echo -e "  ${GREEN}✔${RESET} MD   : $rmd"   || echo -e "  ${DIM}✗ MD not generated yet${RESET}"
-    [ -f "$rhtml" ] && echo -e "  ${GREEN}✔${RESET} HTML : $rhtml" || echo -e "  ${DIM}✗ HTML not generated yet${RESET}"
-    echo -e "  ${BOLD}Dir :${RESET} $out"
-    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+    [ -f "${out}/report/report.html" ] \
+        && echo -e "  HTML : ${out}/report/report.html" \
+        || echo -e "  ${DIM}report.html not generated yet${RESET}"
+    echo -e "  Dir  : $out"
+    echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo ""
 }
 
-# ══════════════════════════════════════════
-# CONTROL
-# ══════════════════════════════════════════
+# ══ CONTROL ═══════════════════════════════════════════════════
 cmd_pause() {
-    touch "$HOME/bb/${1}/.paused"
-    log_success "Pause → ${BOLD}$1${RESET}  (takes effect at next checkpoint ~15s)"
-    log_info "Resume: bbq unpause $1"
+    mkdir -p "$BB_DIR/${1}"
+    touch "$BB_DIR/${1}/.paused"
+    log_success "Pause → ${BOLD}$1${RESET}  (takes effect within ~15s)"
 }
 
 cmd_unpause() {
-    rm -f "$HOME/bb/${1}/.paused" "$HOME/bb/${1}/.sys_paused"
+    rm -f "$BB_DIR/${1}/.paused" "$BB_DIR/${1}/.sys_paused"
     log_success "Unpause → ${BOLD}$1${RESET}"
 }
 
 cmd_stop() {
-    local target="$1" killed=false
+    local tgt="$1" killed=false
     while IFS=$'\t' read -r t type status pid rest; do
-        [ "$t" != "$target" ] || [ "$status" != "running" ] && continue
-        local pf="$HOME/bb/${target}/.scan_pid"
-        [ -f "$pf" ] && pid=$(cat "$pf")
-        [ -z "$pid" ] && continue
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null; sleep 2
-            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
-            log_success "Stopped ${BOLD}$target${RESET} [$type] PID=$pid"; killed=true
+        [ "$t" != "$tgt" ] || [ "$status" != "running" ] && continue
+        local rp
+        rp=$(get_real_pid "$tgt" "$type")
+        if pid_alive "$rp"; then
+            kill_job "$tgt" "$rp" TERM
+            sleep 2
+            pid_alive "$rp" && kill_job "$tgt" "$rp" KILL
+        else
+            kill_job "$tgt" "${rp:-0}" KILL
         fi
-        local wp="$HOME/bb/${target}/.watchdog_pid"
-        [ -f "$wp" ] && kill "$(cat "$wp")" 2>/dev/null && rm -f "$wp"
-        q_set "$target" "$type" "stopped" ""
+        log_success "Stopped ${BOLD}$tgt${RESET} [$type] PID=${rp:---}"
+        killed=true
+        local wp="$BB_DIR/${tgt}/.watchdog_pid"
+        [ -f "$wp" ] && kill "$(cat "$wp")" 2>/dev/null
+        rm -f "$wp" "$BB_DIR/${tgt}/.paused" "$BB_DIR/${tgt}/.sys_paused"
+        q_set "$tgt" "$type" "stopped" ""
     done < "$QUEUE_FILE"
-    $killed || log_warn "No running process for '$target'."
-    log_info "State preserved. Re-queue: bbq retry $target"
+    $killed || log_warn "No running process for '$tgt'. Try: bbq fix"
+    log_info "Checkpoint saved — resume: bbq retry $tgt"
 }
 
 cmd_remove() {
-    local target="$1"
-    grep -q "^${target}	" "$QUEUE_FILE" 2>/dev/null && cmd_stop "$target" 2>/dev/null
-    q_remove_all "$target"
-    log_success "Removed '${BOLD}$target${RESET}' from queue."
+    cmd_stop "$1" 2>/dev/null
+    q_remove_all "$1"
+    log_success "Removed '${BOLD}$1${RESET}' from queue."
 }
 
 cmd_retry() {
-    local target="$1"; shift; local extra="$*"
-    if ! grep -q "^${target}	" "$QUEUE_FILE" 2>/dev/null; then
-        log_error "'$target' not in queue."; return 1
-    fi
-    while IFS=$'\t' read -r t type status pid added_at opts; do
-        [ "$t" != "$target" ] && continue
-        local combined; combined=$(echo "$opts $extra" | xargs)
-        grep -v "^${target}	${type}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" && mv "${QUEUE_FILE}.tmp" "$QUEUE_FILE"
-        if [ "$type" = "scan" ]; then
-            local rs; rs=$(grep "^${target}	recon	" "$QUEUE_FILE" 2>/dev/null | tail -1 | cut -f3)
-            if [ "$rs" = "done" ] || [ -z "$rs" ]; then
-                printf '%s\t%s\tqueued\t\t%s\t%s\n'  "$target" "$type" "$(date '+%Y-%m-%d %H:%M:%S')" "$combined" >> "$QUEUE_FILE"
-            else
-                printf '%s\t%s\twaiting\t\t%s\t%s\n' "$target" "$type" "$(date '+%Y-%m-%d %H:%M:%S')" "$combined" >> "$QUEUE_FILE"
-            fi
+    local tgt="$1"
+    shift
+    local extra="$*"
+    grep -q "^${tgt}	" "$QUEUE_FILE" 2>/dev/null || { log_error "'$tgt' not in queue."; return 1; }
+    local entries
+    entries=$(grep "^${tgt}	" "$QUEUE_FILE")
+    while IFS=$'\t' read -r t type status pid at opts; do
+        [ "$t" != "$tgt" ] && continue
+        local combined
+        combined=$(echo "$opts $extra" | xargs)
+        grep -v "^${tgt}	${type}	" "$QUEUE_FILE" > "${QUEUE_FILE}.tmp" && q_write
+        if [ "$type" = "scan" ] && ! recon_is_done "$tgt"; then
+            printf '%s\t%s\twaiting\t\t%s\t%s\n' \
+                "$tgt" "$type" "$(date '+%Y-%m-%d %H:%M:%S')" "$combined" >> "$QUEUE_FILE"
+            log_success "Re-queued [$type]: ${BOLD}$tgt${RESET} — ${YELLOW}waiting for recon${RESET}"
         else
-            printf '%s\t%s\tqueued\t\t%s\t%s\n' "$target" "$type" "$(date '+%Y-%m-%d %H:%M:%S')" "$combined" >> "$QUEUE_FILE"
+            printf '%s\t%s\tqueued\t\t%s\t%s\n' \
+                "$tgt" "$type" "$(date '+%Y-%m-%d %H:%M:%S')" "$combined" >> "$QUEUE_FILE"
+            log_success "Re-queued [$type]: ${BOLD}$tgt${RESET}"
         fi
-        log_success "Re-queued [${CYAN}${type}${RESET}]: ${BOLD}$target${RESET}"
-    done < <(grep "^${target}	" "$QUEUE_FILE")
+    done <<< "$entries"
     daemon_running || daemon_start
 }
 
-# ══════════════════════════════════════════
-# ADD COMMANDS
-# ══════════════════════════════════════════
+# ══ ADD COMMANDS ══════════════════════════════════════════════
 check_scripts() {
     local ok=true
     [ ! -f "$RECON_SH" ] && { log_error "recon.sh not found: $RECON_SH"; ok=false; }
     [ ! -f "$SCAN_SH"  ] && { log_error "scan.sh not found: $SCAN_SH";   ok=false; }
-    $ok || { log_error "All scripts must be in the same directory as bbq."; exit 1; }
+    $ok || { log_error "Scripts must be in the same directory as bbq."; exit 1; }
 }
 
 cmd_recon() {
-    local target="$1"; shift; check_scripts
-    [ -z "$target" ] && { log_error "Usage: bbq recon <target> [opts]"; exit 1; }
-    q_add "$target" "recon" "queued" "$*" || return 1
-    daemon_running || daemon_start; echo ""; cmd_status
+    local tgt="$1"
+    shift
+    check_scripts
+    [ -z "$tgt" ] && { log_error "Usage: bbq recon <target>"; exit 1; }
+    q_add "$tgt" "recon" "queued" "$*" || return 1
+    daemon_running || daemon_start
+    echo ""
+    cmd_status
 }
 
 cmd_scan() {
-    local target="$1"; shift; check_scripts
-    [ -z "$target" ] && { log_error "Usage: bbq scan <target> [opts]"; exit 1; }
-    local rdone=false
-    grep -q "^${target}	recon	done	" "$QUEUE_FILE" 2>/dev/null && rdone=true
-    [ -f "$HOME/bb/${target}/.recon_steps" ] && rdone=true
-    if $rdone; then q_add "$target" "scan" "queued"  "$*" || return 1
-    else        log_warn "Recon not done — scan will wait."
-                q_add "$target" "scan" "waiting" "$*" || return 1; fi
-    daemon_running || daemon_start; echo ""; cmd_status
+    local tgt="$1"
+    shift
+    check_scripts
+    [ -z "$tgt" ] && { log_error "Usage: bbq scan <target>"; exit 1; }
+    if recon_is_done "$tgt"; then
+        log_info "Recon data found — queuing scan"
+        q_add "$tgt" "scan" "queued" "$*" || return 1
+    else
+        log_warn "No recon data for '$tgt' — scan will wait for recon to complete"
+        log_info "Start recon with: bbq recon $tgt"
+        q_add "$tgt" "scan" "waiting" "$*" || return 1
+    fi
+    daemon_running || daemon_start
+    echo ""
+    cmd_status
 }
 
 cmd_pipe() {
-    local target="$1"; shift; check_scripts
-    [ -z "$target" ] && { log_error "Usage: bbq pipe <target> [opts]"; exit 1; }
-    q_add "$target" "recon" "queued"  "$*" || return 1
-    q_add "$target" "scan"  "waiting" "$*"
-    daemon_running || daemon_start; echo ""; cmd_status
-}
-
-cmd_fresh() {
-    local target="$1"; shift; check_scripts
-    [ -z "$target" ] && { log_error "Usage: bbq fresh <target> [opts]"; exit 1; }
-    q_remove_all "$target"
-    q_add "$target" "recon" "queued"  "--fresh $*"
-    q_add "$target" "scan"  "waiting" "--fresh $*"
-    daemon_running || daemon_start; echo ""; cmd_status
-}
-
-# ══════════════════════════════════════════
-# USAGE
-# ══════════════════════════════════════════
-usage() {
-    print_banner
-    echo -e "${BOLD}Usage:${RESET} bbq <command> [target] [options]"
+    local tgt="$1"
+    shift
+    check_scripts
+    [ -z "$tgt" ] && { log_error "Usage: bbq pipe <target>"; exit 1; }
+    q_add "$tgt" "recon" "queued"  "$*" || return 1
+    q_add "$tgt" "scan"  "waiting" "$*"
+    daemon_running || daemon_start
     echo ""
+    cmd_status
+}
+
+# ══ USAGE ═════════════════════════════════════════════════════
+usage() {
+    echo -e "${RED}${BOLD}  BBQ — Bug Bounty Queue v4.0${RESET}\n"
+    echo -e "${BOLD}Usage:${RESET} bbq <command> [target] [options]\n"
     echo -e "${CYAN}${BOLD}Queue:${RESET}"
-    echo "  recon  <target> [opts]    Recon only"
-    echo "  scan   <target> [opts]    Vuln scan only (waits for recon if needed)"
-    echo "  pipe   <target> [opts]    Recon → scan pipeline"
-    echo "  fresh  <target> [opts]    Wipe state + restart pipeline"
+    echo "  pipe   <target> [opts]   recon → scan pipeline"
+    echo "  recon  <target> [opts]   recon only"
+    echo "  scan   <target> [opts]   scan only"
     echo ""
     echo -e "${CYAN}${BOLD}Monitor:${RESET}"
-    echo "  status / ls               All jobs + state"
-    echo "  watch  [secs]             Live auto-refreshing board"
-    echo "  logs   <target> [type]    Tail log (type: recon|scan)"
-    echo "  report <target>           Finding counts + file paths"
-    echo "  stats                     CPU/RAM + running job details"
+    echo "  status / ls              queue + resource overview"
+    echo "  watch  [secs]            live auto-refresh (default 3s)"
+    echo "  logs   <target> [type]   tail log (recon|scan)"
+    echo "  stats                    CPU/RAM + running job details"
+    echo "  report <target>          finding counts + output paths"
     echo ""
     echo -e "${CYAN}${BOLD}Control:${RESET}"
-    echo "  pause   <target>          Pause at next checkpoint"
-    echo "  unpause <target>          Resume"
-    echo "  stop    <target>          Stop cleanly (state saved)"
-    echo "  retry   <target> [opts]   Re-queue stopped/failed job"
-    echo "  remove  <target>          Remove all jobs for target"
+    echo "  pause   <target>         pause at next checkpoint"
+    echo "  unpause <target>         resume"
+    echo "  stop    <target>         stop + save checkpoint"
+    echo "  retry   <target> [opts]  re-queue stopped/failed job"
+    echo "  remove  <target>         remove from queue entirely"
+    echo ""
+    echo -e "${RED}${BOLD}Rescue:${RESET}"
+    echo "  fix                      reconcile queue + kill orphaned processes"
+    echo "  kill-all                 stop everything"
     echo ""
     echo -e "${CYAN}${BOLD}Settings:${RESET}"
-    echo "  config                    Show config + calculated values"
-    echo "  config set KEY VALUE      Change a setting e.g.:"
-    echo "    bbq config set MAX_JOBS 3"
-    echo "    bbq config set THREAD_BUDGET 60"
-    echo "    bbq config set MIN_FREE_RAM_MB 768"
-    echo "    bbq config set NICE_LEVEL 15"
+    echo "  config                   show settings"
+    echo "  config set MAX_JOBS 1    serial mode (safest)"
     echo ""
     echo -e "${CYAN}${BOLD}Daemon:${RESET}"
-    echo "  daemon          Start"
-    echo "  daemon-stop     Stop"
-    echo "  daemon-status   Check"
+    echo "  daemon                   start"
+    echo "  daemon-stop              stop (scans continue)"
+    echo "  daemon-status            check + heartbeat"
     echo ""
-    echo -e "${CYAN}${BOLD}Examples:${RESET}"
-    echo "  bbq pipe target1.com"
-    echo "  bbq pipe target2.com --invasive       ← queued, runs when slot free"
-    echo "  bbq watch                             ← live board"
-    echo "  bbq stats                             ← CPU/RAM/job details"
-    echo "  bbq config set MAX_JOBS 3"
+    echo -e "${CYAN}${BOLD}Recovery:${RESET}"
+    echo "  bbq kill-all && bbq fix && bbq daemon && bbq retry <target>"
     echo ""
-    echo -e "${DIM}Concurrency is safe: threads auto-split across jobs, resource gates"
-    echo -e "prevent OOM, system watchdog auto-pauses if things spike.${RESET}"
     exit 0
 }
 
-# ══════════════════════════════════════════
-# DISPATCH
-# ══════════════════════════════════════════
+# ══ DISPATCH ══════════════════════════════════════════════════
 [ "$#" -eq 0 ] && usage
 CMD="$1"; shift
-
 case "$CMD" in
-    recon)          cmd_recon  "$@" ;;
-    scan)           cmd_scan   "$@" ;;
-    pipe)           cmd_pipe   "$@" ;;
-    fresh)          cmd_fresh  "$@" ;;
+    pipe)           cmd_pipe    "$@" ;;
+    recon)          cmd_recon   "$@" ;;
+    scan)           cmd_scan    "$@" ;;
     status|ls)      cmd_status ;;
-    watch)          cmd_watch  "$@" ;;
-    logs|log)       cmd_logs   "$@" ;;
-    report)         cmd_report "${1:?Usage: bbq report <target>}" ;;
+    watch)          cmd_watch   "$@" ;;
+    logs|log)       cmd_logs    "$@" ;;
     stats)          cmd_stats ;;
-    config)         cmd_config "$@" ;;
+    report)         cmd_report  "${1:?Usage: bbq report <target>}" ;;
+    config)         cmd_config  "$@" ;;
     pause)          cmd_pause   "${1:?Usage: bbq pause <target>}" ;;
     unpause|resume) cmd_unpause "${1:?Usage: bbq unpause <target>}" ;;
     stop)           cmd_stop    "${1:?Usage: bbq stop <target>}" ;;
-    retry)          cmd_retry  "$@" ;;
+    retry)          cmd_retry   "$@" ;;
     remove|rm)      cmd_remove  "${1:?Usage: bbq remove <target>}" ;;
+    fix)            cmd_fix ;;
+    kill-all)       cmd_kill_all ;;
     daemon)         daemon_start ;;
     daemon-stop)    daemon_stop ;;
     daemon-status)  daemon_status_cmd ;;
