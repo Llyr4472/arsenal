@@ -125,8 +125,8 @@ TARGET="$1"; shift
 THREADS=50
 RATE_LIMIT=3000
 FRESH_START=false
-SKIP_BRUTE=false
-SKIP_PERMS=false
+DNS_BRUTE=false
+DNS_PERMS=false
 SKIP_CRAWL=false
 REDO_STEPS=()
 WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
@@ -142,8 +142,8 @@ while [[ $# -gt 0 ]]; do
         --rate-limit)  RATE_LIMIT="$2";          shift 2 ;;
         --fresh)       FRESH_START=true;         shift   ;;
         --redo)        REDO_STEPS+=("$2");       shift 2 ;;
-        --skip-brute)  SKIP_BRUTE=true;          shift   ;;
-        --skip-perms)  SKIP_PERMS=true;          shift   ;;
+        --dns-brute)   DNS_BRUTE=true;          shift   ;;
+        --dns-perms)   DNS_PERMS=true;          shift   ;;
         --skip-crawl)  SKIP_CRAWL=true;          shift   ;;
         -h|--help)     usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -301,8 +301,8 @@ fi
 
 # ══ PHASE 2: DNS Bruteforce ════════════════════════════════════
 STEP="phase_2_bruteforce"
-if [ "$SKIP_BRUTE" = "true" ]; then
-    log_phase "Phase 2: DNS Bruteforce [SKIPPED via --skip-brute]"
+if [ "$DNS_BRUTE" = "false" ]; then
+    log_phase "Phase 2: DNS Bruteforce [SKIPPED without --dns-brute]"
     safe_touch "$OUT_DIR/brute_subs.txt"
 elif step_done "$STEP"; then
     log_phase "Phase 2: DNS Bruteforce [DONE — SKIPPED]"
@@ -350,8 +350,8 @@ ALIVE_BASE_COUNT=$(count_lines "$OUT_DIR/base_resolved.txt")
 
 # ══ PHASE 4: Permutations ═════════════════════════════════════
 STEP="phase_4_permutations"
-if [ "$SKIP_PERMS" = "true" ]; then
-    log_phase "Phase 4: Permutations [SKIPPED via --skip-perms]"
+if [ "$DNS_PERMS" = "false" ]; then
+    log_phase "Phase 4: Permutations [SKIPPED without --dns-perms]"
     safe_touch "$OUT_DIR/permutations_resolved.txt"
 elif step_done "$STEP"; then
     log_phase "Phase 4: Permutations [DONE — SKIPPED]"
@@ -389,15 +389,30 @@ else
         log_warn "No subdomains to probe."
         safe_touch "$OUT_DIR/alive.txt" "$OUT_DIR/web_alive.txt" "$OUT_DIR/alive_urls_only.txt"
     else
+        # Always start with base subdomains (for default HTTP/HTTPS ports)
+        cp "$OUT_DIR/final_subdomains.txt" "$OUT_DIR/alive.txt"
+        
         if require_tool naabu; then
             log_info "Port scanning $local_total subdomains (top-1000)..."
             run_tool "naabu" "naabu port scan for $TARGET" \
                 naabu -list "$OUT_DIR/final_subdomains.txt" \
-                      -top-ports 5000 -silent -o "$OUT_DIR/alive.txt"
-        else
-            cp "$OUT_DIR/final_subdomains.txt" "$OUT_DIR/alive.txt"
+                      -top-ports 1000 -silent -o "$OUT_DIR/.naabu_temp.txt"
+            
+            # Append naabu results (hosts with non-standard ports) to alive.txt
+            if [ -s "$OUT_DIR/.naabu_temp.txt" ]; then
+                cut -d: -f1 "$OUT_DIR/.naabu_temp.txt" | sort -u >> "$OUT_DIR/alive.txt"
+                sort -u "$OUT_DIR/alive.txt" -o "$OUT_DIR/alive.txt"
+                sync
+            fi
+            
+            log_ok "Open ports: ${BOLD}$(count_lines "$OUT_DIR/.naabu_temp.txt")${RESET}"
+            rm -f "$OUT_DIR/.naabu_temp.txt"
         fi
-        log_ok "Open ports: ${BOLD}$(count_lines "$OUT_DIR/alive.txt")${RESET}"
+        
+        # Delay to avoid rate limiting after port scan
+        log_info "Waiting 5s before HTTP probe to avoid rate limiting..."
+        sleep 5
+        
         wait_if_paused
 
         if require_tool httpx; then
@@ -405,7 +420,9 @@ else
             run_tool "httpx" "httpx HTTP probe for $TARGET" \
                 httpx -l "$OUT_DIR/alive.txt" \
                       -title -tech-detect -status-code -ip -cdn \
-                      -follow-redirects -threads "$THREADS" -silent \
+                      -follow-redirects -threads "$THREADS" \
+                      -retries 2 \
+                      -timeout 10 \
                       -o "$OUT_DIR/web_alive.txt"
             awk '{print $1}' "$OUT_DIR/web_alive.txt" > "$OUT_DIR/alive_urls_only.txt"
             log_ok "Live web servers: ${BOLD}$(count_lines "$OUT_DIR/web_alive.txt")${RESET}"
