@@ -210,15 +210,76 @@ refresh_resolvers() {
     local stale=false
     [ ! -f "$RESOLVERS" ] && stale=true
     [ -n "$(find "$RESOLVERS" -mtime +7 2>/dev/null)" ] && stale=true
+
+    # Also treat as stale if file has fewer than 100 resolvers (corrupted/truncated)
+    if [ -f "$RESOLVERS" ] && [ "$(count_lines "$RESOLVERS")" -lt 100 ]; then
+        log_warn "Resolver file too small ($(count_lines "$RESOLVERS") entries) — refreshing."
+        stale=true
+    fi
+
     if $stale; then
         log_info "Refreshing resolver list..."
-        if curl -s --max-time 30 \
-            "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" \
-            -o "$RESOLVERS" 2>>"$LOGS_DIR/resolver_refresh.log"; then
-            log_ok "Resolvers: $(count_lines "$RESOLVERS") entries"
-        else
-            log_warn "Resolver refresh failed — using existing or proceeding without."
+        local tmp_resolvers
+        tmp_resolvers="$(mktemp)"
+
+        local sources=(
+            "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt"
+            "https://raw.githubusercontent.com/janmasarik/resolvers/master/resolvers.txt"
+            "https://raw.githubusercontent.com/proabiral/fresh-resolvers/master/resolvers.txt"
+        )
+
+        local fetched=false
+        for url in "${sources[@]}"; do
+            if curl -s --max-time 30 "$url" -o "$tmp_resolvers" 2>>"$LOGS_DIR/resolver_refresh.log"; then
+                local count
+                count=$(count_lines "$tmp_resolvers")
+                if [ "$count" -ge 100 ]; then
+                    mv "$tmp_resolvers" "$RESOLVERS"
+                    fetched=true
+                    log_ok "Resolvers: $count entries"
+                    break
+                else
+                    log_warn "Source returned only $count resolvers, trying next..."
+                fi
+            fi
+        done
+
+        if ! $fetched; then
+            rm -f "$tmp_resolvers"
+            log_warn "All resolver sources failed — using fallback resolvers."
+            echo -e "8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n9.9.9.10\n149.112.112.112" > "$RESOLVERS"
         fi
+    else
+        log_info "Resolvers up to date: $(count_lines "$RESOLVERS") entries"
+    fi
+
+    log_info "Validating resolvers..."
+
+    local sample_resolvers test_domain working=0
+    sample_resolvers="$(mktemp)"
+    test_domain="$(mktemp)"
+    echo "google.com" > "$test_domain"
+
+    # Try up to 3 times with increasing sample sizes before giving up
+    for attempt in 1 2 3; do
+        local sample_size=$(( attempt * 100 ))
+        shuf -n "$sample_size" "$RESOLVERS" > "$sample_resolvers"
+        working=$(dnsx -silent -r "$sample_resolvers" -l "$test_domain" \
+            -rl 100 -timeout 10 2>/dev/null | grep -c 'google.com')
+        [ "$working" -gt 0 ] && break
+        log_warn "Resolver validation attempt $attempt failed, retrying with larger sample..."
+        sleep 2
+    done
+
+    rm -f "$sample_resolvers" "$test_domain"
+
+    if [ "$working" -eq 0 ]; then
+        log_warn "Resolver validation failed after 3 attempts — falling back to trusted resolvers."
+        local fallback="$OUT_DIR/resolvers_fallback.txt"
+        echo -e "8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n9.9.9.10\n149.112.112.112" > "$fallback"
+        RESOLVERS="$fallback"
+    else
+        log_ok "Resolvers validated OK ($(count_lines "$RESOLVERS") available)"
     fi
 }
 
