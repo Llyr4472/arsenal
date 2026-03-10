@@ -512,11 +512,15 @@ else
         log_warn "No live web servers — skipping crawl."
         safe_touch "$OUT_DIR/clean_urls.txt"
     else
-        if require_tool waymore; then
-            log_info "Running waymore..."
-            run_tool "waymore" "waymore URL discovery for $TARGET" \
-                waymore -i "$TARGET" -mode U -oU "$OUT_DIR/waymore_urls.txt"
-            log_ok "Waymore: $(count_lines "$OUT_DIR/waymore_urls.txt") URLs"
+if require_tool waymore; then
+        log_info "Running waymore..."
+        run_tool "waymore" "waymore URL discovery for $TARGET" \
+            timeout 300 waymore -i "$TARGET" -mode U -oU "$OUT_DIR/waymore_urls.txt"
+        local ec=$?
+        if [ $ec -eq 124 ]; then
+            log_warn "Waymore timed out after 5min — using partial results."
+        fi
+        log_ok "Waymore: $(count_lines "$OUT_DIR/waymore_urls.txt") URLs"
         fi
         wait_if_paused
 
