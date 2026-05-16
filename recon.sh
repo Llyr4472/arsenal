@@ -373,18 +373,22 @@ else
     fi
     wait_if_paused
 
-    # amass v4 — opt-in, passive only, hard timeout
+    # amass v5 — opt-in, passive only, hard timeout
     if [ "$ENABLE_AMASS" = "true" ]; then
         if require_tool amass; then
-            log_info "Running amass v4 passive (timeout 10min)..."
+            log_info "Running amass v5 passive (timeout 10min)..."
+            mkdir -p "$OUT_DIR/amass_db"
             run_tool "amass" "amass enum passive $TARGET" \
-                timeout 600 amass enum -passive -d "$TARGET" -o "$OUT_DIR/amass.txt"
+                timeout 600 amass enum -passive -d "$TARGET" \
+                    -dir "$OUT_DIR/amass_db"
             ec=$?
-            [ $ec -eq 124 ] && log_warn "Amass timed out after 10min — partial results kept."
+            [ "$ec" -eq 124 ] && log_warn "Amass timed out — partial results kept."
+            amass subs -names -d "$TARGET" -dir "$OUT_DIR/amass_db" \
+                > "$OUT_DIR/amass.txt" 2>/dev/null
             log_ok "Amass: $(count_lines "$OUT_DIR/amass.txt") subs"
         fi
     else
-        log_info "Amass skipped — use --amass to enable (recommended with API keys)"
+        log_info "Amass skipped — use --amass to enable"
     fi
 
     cat "$OUT_DIR/subfinder.txt"   "$OUT_DIR/assetfinder.txt" \
