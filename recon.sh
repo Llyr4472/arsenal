@@ -379,7 +379,7 @@ else
             log_info "Running amass v4 passive (timeout 10min)..."
             run_tool "amass" "amass enum passive $TARGET" \
                 timeout 600 amass enum -passive -d "$TARGET" -o "$OUT_DIR/amass.txt"
-            local ec=$?
+            ec=$?
             [ $ec -eq 124 ] && log_warn "Amass timed out after 10min — partial results kept."
             log_ok "Amass: $(count_lines "$OUT_DIR/amass.txt") subs"
         fi
