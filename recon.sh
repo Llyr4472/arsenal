@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════
-#  recon.sh v5.0 — Smart Recon | Resume | bbq-managed
+#  recon.sh v5.1 — Smart Recon | Resume | bbq-managed
 #
 #  Phase 1 : Passive enum (subfinder, assetfinder, crt.sh, OTX,
 #             github-subdomains, amass v4 opt-in)
@@ -11,6 +11,8 @@
 #  Phase 6 : URL discovery (waymore, gau) + JS collection
 #             + katana (--crawl)
 #  Phase 7 : Parameter extraction
+#  Phase 7.5: JS analysis + DOM XSS (--js)
+#             (LinkFinder, SecretFinder, TruffleHog, nuclei, dalfox)
 #  Phase 8 : Port scan (naabu, excl default HTTP ports)
 #             + HTTP probe pass 2 (httpx on host:port findings)
 #             → merged all_web_alive.txt
@@ -119,12 +121,14 @@ usage() {
     echo -e "  ${BOLD}--redo <step>${RESET}          Re-run one specific step (keeps all others)"
     echo ""
     echo "    Steps: passive  bruteforce  resolve  permutations"
-    echo "           probing  crawling    params   ports"
+    echo "           probing  crawling    params   js  ports"
     echo ""
     echo -e "  ${BOLD}--amass${RESET}                Enable amass v4 passive enum (slow, use with API keys)"
     echo -e "  ${BOLD}--dns-brute${RESET}            Enable DNS bruteforce"
     echo -e "  ${BOLD}--dns-perms${RESET}            Enable subdomain permutation generation"
     echo -e "  ${BOLD}--crawl${RESET}                Enable katana active crawling (intrusive)"
+    echo -e "  ${BOLD}--js${RESET}                   Enable JS analysis + DOM XSS scan"
+    echo -e "                         (LinkFinder, SecretFinder, TruffleHog, nuclei, dalfox)"
     echo -e "  ${BOLD}--skip-urls${RESET}            Skip all URL discovery (waymore/gau/katana)"
     echo ""
     echo "  Resume: just re-run — completed phases are skipped automatically."
@@ -143,6 +147,7 @@ DNS_PERMS=false
 SKIP_URLS=false
 ENABLE_AMASS=false
 ENABLE_KATANA=false
+ENABLE_JS=false
 REDO_STEPS=()
 WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
 RESOLVERS="$HOME/resolvers.txt"
@@ -164,6 +169,7 @@ while [[ $# -gt 0 ]]; do
         --dns-brute)   DNS_BRUTE=true;       shift   ;;
         --dns-perms)   DNS_PERMS=true;       shift   ;;
         --crawl)       ENABLE_KATANA=true;   shift   ;;
+        --js)          ENABLE_JS=true;       shift   ;;
         --skip-urls)   SKIP_URLS=true;       shift   ;;
         -h|--help)     usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -192,7 +198,7 @@ echo "[$(TS)] ============================================"          >> "$LOG_FI
 echo "[$(TS)] [START] recon.sh $TARGET  pid=$$"                     >> "$LOG_FILE"
 echo "[$(TS)] [ARGS]  threads=$THREADS rate=$RATE_LIMIT"            >> "$LOG_FILE"
 echo "[$(TS)] [FLAGS] fresh=$FRESH_START amass=$ENABLE_AMASS"       >> "$LOG_FILE"
-echo "[$(TS)] [FLAGS] brute=$DNS_BRUTE perms=$DNS_PERMS crawl=$ENABLE_KATANA" >> "$LOG_FILE"
+echo "[$(TS)] [FLAGS] brute=$DNS_BRUTE perms=$DNS_PERMS crawl=$ENABLE_KATANA js=$ENABLE_JS" >> "$LOG_FILE"
 echo "[$(TS)] ============================================"          >> "$LOG_FILE"
 
 if [ "$FRESH_START" = "true" ]; then
@@ -202,7 +208,7 @@ if [ "$FRESH_START" = "true" ]; then
     rm -f "$LOGS_DIR"/*.log 2>/dev/null
 fi
 
-# ── Redo specific steps (bug fix: was always force-redoing phase_1_passive) ──
+# ── Redo specific steps ───────────────────────────────────────
 for step in "${REDO_STEPS[@]}"; do
     case "$step" in
         passive)      force_redo_step "phase_1_passive" ;;
@@ -212,6 +218,7 @@ for step in "${REDO_STEPS[@]}"; do
         probing)      force_redo_step "phase_5_probing" ;;
         crawling)     force_redo_step "phase_6_crawling" ;;
         params)       force_redo_step "phase_7_params" ;;
+        js)           force_redo_step "phase_7_5_js" ;;
         ports)        force_redo_step "phase_8_ports" ;;
         *) log_warn "Unknown step for --redo: $step" ;;
     esac
@@ -313,7 +320,7 @@ echo -e "  ${BOLD}Output   :${RESET} $OUT_DIR"
 echo -e "  ${BOLD}Logs     :${RESET} $LOGS_DIR"
 echo -e "  ${BOLD}PID/PGID :${RESET} $$ / $(cat "$OUT_DIR/.scan_pgid")"
 echo -e "  ${BOLD}Threads  :${RESET} $THREADS   ${BOLD}Rate:${RESET} $RATE_LIMIT   ${BOLD}Resume:${RESET} $IS_RESUME"
-echo -e "  ${BOLD}Flags    :${RESET} amass=$ENABLE_AMASS brute=$DNS_BRUTE perms=$DNS_PERMS crawl=$ENABLE_KATANA"
+echo -e "  ${BOLD}Flags    :${RESET} amass=$ENABLE_AMASS brute=$DNS_BRUTE perms=$DNS_PERMS crawl=$ENABLE_KATANA js=$ENABLE_JS"
 echo ""
 
 refresh_resolvers
@@ -373,13 +380,14 @@ else
     fi
     wait_if_paused
 
-    # amass — opt-in, active enum, hard timeout
+    # amass — opt-in, active enum, silent
     if [ "$ENABLE_AMASS" = "true" ]; then
         if require_tool amass; then
-            log_info "Running amass active (timeout 10min)..."
-            timeout 600 amass enum -d "$TARGET" | tee "$OUT_DIR/amass.txt"
-            ec=$?
-            [ "$ec" -eq 124 ] && log_warn "Amass timed out — partial results kept."
+            log_info "Running amass active "
+            run_tool "amass" "amass active $TARGET" \
+                bash -c "timeout 600 amass enum -d '$TARGET' -silent \
+                    -o '$OUT_DIR/amass.txt'; \
+                    ec=\$?; [ \$ec -eq 124 ] && echo '[amass] timed out — partial results kept'"
             log_ok "Amass: $(count_lines "$OUT_DIR/amass.txt") subs"
         fi
     else
@@ -633,6 +641,166 @@ else
     mark_step_done "$STEP"
 fi
 
+# ══ PHASE 7.5: JS Analysis + DOM XSS ═════════════════════════
+# Runs LinkFinder (endpoint extraction), SecretFinder (secrets),
+# TruffleHog (entropy-based secrets), nuclei exposures, dalfox DOM XSS.
+# Opt-in via --js flag.
+STEP="phase_7_5_js"
+JS_DIR="$OUT_DIR/js_analysis"
+
+if [ "$ENABLE_JS" = "false" ]; then
+    log_phase "Phase 7.5: JS Analysis + DOM XSS [SKIPPED — use --js]"
+elif step_done "$STEP"; then
+    log_phase "Phase 7.5: JS Analysis + DOM XSS [DONE — SKIPPED]"
+else
+    log_phase "Phase 7.5: JS Analysis + DOM XSS"
+    wait_if_paused
+
+    mkdir -p "$JS_DIR"
+    safe_touch "$JS_DIR/linkfinder_endpoints.txt" \
+               "$JS_DIR/secretfinder_out.txt"     \
+               "$JS_DIR/trufflehog_hits.txt"      \
+               "$JS_DIR/nuclei_exposure.txt"       \
+               "$JS_DIR/dalfox_findings.txt"
+
+    JS_COUNT=$(count_lines "$OUT_DIR/js_urls.txt")
+
+    # ── JS file analysis block ─────────────────────────────────
+    if [ "$JS_COUNT" -eq 0 ]; then
+        log_warn "No JS files collected — skipping JS analysis tools."
+    else
+        log_info "Analyzing $JS_COUNT JS files..."
+
+        # ── Download JS to disk ────────────────────────────────
+        # All tools that need file content read from here.
+        # Tools that work better against live URLs (nuclei) use js_urls.txt directly.
+        JS_DOWNLOADED="$JS_DIR/downloaded"
+        mkdir -p "$JS_DOWNLOADED"
+
+        log_info "Downloading JS files to disk..."
+        while IFS= read -r js_url; do
+            [ -z "$js_url" ] && continue
+            local_name=$(printf '%s' "$js_url" | md5sum | cut -d' ' -f1).js
+            curl -sk \
+                 --max-time 15 \
+                 --retry 2 \
+                 -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+                 "$js_url" \
+                 -o "$JS_DOWNLOADED/$local_name" 2>/dev/null
+        done < "$OUT_DIR/js_urls.txt"
+
+        DOWNLOADED_COUNT=$(find "$JS_DOWNLOADED" -name "*.js" -size +0c 2>/dev/null | wc -l)
+        log_ok "Downloaded: $DOWNLOADED_COUNT non-empty JS files"
+
+        # ── LinkFinder — endpoint extraction ──────────────────
+        # Runs against live URLs (handles minified JS better via HTTP context).
+        if require_tool linkfinder; then
+            log_info "Running LinkFinder on $JS_COUNT JS files..."
+            > "$JS_DIR/linkfinder_endpoints.txt"
+            while IFS= read -r js_url; do
+                [ -z "$js_url" ] && continue
+                linkfinder -i "$js_url" -o cli 2>/dev/null \
+                    >> "$JS_DIR/linkfinder_endpoints.txt"
+            done < "$OUT_DIR/js_urls.txt"
+            sort -u "$JS_DIR/linkfinder_endpoints.txt" \
+                -o "$JS_DIR/linkfinder_endpoints.txt"
+            log_ok "LinkFinder endpoints: $(count_lines "$JS_DIR/linkfinder_endpoints.txt")"
+        else
+            # Try python3 invocation if not on PATH
+            SF_LINK="${LINKFINDER_PATH:-$HOME/tools/LinkFinder/linkfinder.py}"
+            if [ -f "$SF_LINK" ]; then
+                log_info "Running LinkFinder (python3) on $JS_COUNT JS files..."
+                > "$JS_DIR/linkfinder_endpoints.txt"
+                while IFS= read -r js_url; do
+                    [ -z "$js_url" ] && continue
+                    python3 "$SF_LINK" -i "$js_url" -o cli 2>/dev/null \
+                        >> "$JS_DIR/linkfinder_endpoints.txt"
+                done < "$OUT_DIR/js_urls.txt"
+                sort -u "$JS_DIR/linkfinder_endpoints.txt" \
+                    -o "$JS_DIR/linkfinder_endpoints.txt"
+                log_ok "LinkFinder endpoints: $(count_lines "$JS_DIR/linkfinder_endpoints.txt")"
+            else
+                log_warn "LinkFinder not found — set LINKFINDER_PATH or install to PATH"
+            fi
+        fi
+        wait_if_paused
+
+        # ── SecretFinder — secret patterns in JS ──────────────
+        # Runs against live URLs. Set SECRETFINDER_PATH in secrets.env if not default.
+        SF_PATH="${SECRETFINDER_PATH:-$HOME/tools/SecretFinder/SecretFinder.py}"
+        if [ -f "$SF_PATH" ]; then
+            log_info "Running SecretFinder on $JS_COUNT JS files..."
+            > "$JS_DIR/secretfinder_out.txt"
+            while IFS= read -r js_url; do
+                [ -z "$js_url" ] && continue
+                python3 "$SF_PATH" -i "$js_url" -o cli 2>/dev/null \
+                    >> "$JS_DIR/secretfinder_out.txt"
+            done < "$OUT_DIR/js_urls.txt"
+            log_ok "SecretFinder hits: $(count_lines "$JS_DIR/secretfinder_out.txt")"
+        else
+            log_warn "SecretFinder not found at $SF_PATH — set SECRETFINDER_PATH in secrets.env"
+        fi
+        wait_if_paused
+
+        # ── TruffleHog — entropy + pattern on downloaded JS ───
+        # Runs against downloaded files for reliable filesystem mode.
+        if require_tool trufflehog; then
+            if [ "$DOWNLOADED_COUNT" -gt 0 ]; then
+                log_info "Running TruffleHog on downloaded JS files..."
+                run_tool "trufflehog_js" "TruffleHog JS secrets" \
+                    bash -c "trufflehog filesystem '$JS_DOWNLOADED' \
+                        --no-verification \
+                        --json \
+                        2>/dev/null > '$JS_DIR/trufflehog_js.json'; \
+                        grep -o '\"Raw\":\"[^\"]*\"' '$JS_DIR/trufflehog_js.json' \
+                            | sort -u > '$JS_DIR/trufflehog_hits.txt'"
+                log_ok "TruffleHog hits: $(count_lines "$JS_DIR/trufflehog_hits.txt")"
+            else
+                log_warn "No downloaded JS files — skipping TruffleHog"
+            fi
+        fi
+        wait_if_paused
+
+        # ── nuclei — exposure templates against live JS URLs ──
+        # Uses live URLs so nuclei can evaluate headers/response context.
+        if require_tool nuclei; then
+            log_info "Running nuclei exposure templates on JS URLs..."
+            run_tool "nuclei_js_exposure" "nuclei JS exposure scan" \
+                nuclei -l "$OUT_DIR/js_urls.txt" \
+                       -t exposures/ \
+                       -silent \
+                       -rl 10 \
+                       -timeout 10 \
+                       -o "$JS_DIR/nuclei_exposure.txt"
+            log_ok "Nuclei exposure findings: $(count_lines "$JS_DIR/nuclei_exposure.txt")"
+        fi
+    fi
+
+    # ── dalfox — DOM XSS on param URLs ────────────────────────
+    # Runs on final_params.txt regardless of JS file count.
+    # Separate from JS analysis block since it targets param endpoints, not JS.
+    PARAM_COUNT=$(count_lines "$OUT_DIR/final_params.txt")
+    wait_if_paused
+
+    if [ "$PARAM_COUNT" -eq 0 ]; then
+        log_warn "No param URLs for DOM XSS scan — skipping dalfox."
+    elif require_tool dalfox; then
+        log_info "Running dalfox on $PARAM_COUNT param URLs..."
+        run_tool "dalfox" "dalfox DOM XSS scan" \
+            dalfox file "$OUT_DIR/final_params.txt" \
+                   --skip-bav \
+                   --no-spinner \
+                   --silence \
+                   --output "$JS_DIR/dalfox_findings.txt" \
+                   --worker "$THREADS" \
+                   --timeout 10 \
+                   --delay 100
+        log_ok "Dalfox findings: $(count_lines "$JS_DIR/dalfox_findings.txt")"
+    fi
+
+    mark_step_done "$STEP"
+fi
+
 # ══ PHASE 8: Port Scan + HTTP Probe Pass 2 ════════════════════
 # naabu on ALL DNS-alive hosts (not just httpx-alive),
 # skipping ports already covered by pass 1.
@@ -708,6 +876,11 @@ SUMMARY="
 [$(TS)] [SUMMARY] Unique URLs:         $(count_lines "$OUT_DIR/clean_urls.txt")
 [$(TS)] [SUMMARY] JS files:            $(count_lines "$OUT_DIR/js_urls.txt")
 [$(TS)] [SUMMARY] Param URLs:          $(count_lines "$OUT_DIR/final_params.txt")
+[$(TS)] [SUMMARY] JS endpoints:        $(count_lines "$JS_DIR/linkfinder_endpoints.txt")
+[$(TS)] [SUMMARY] JS secrets:          $(count_lines "$JS_DIR/secretfinder_out.txt")
+[$(TS)] [SUMMARY] TruffleHog hits:     $(count_lines "$JS_DIR/trufflehog_hits.txt")
+[$(TS)] [SUMMARY] Nuclei JS findings:  $(count_lines "$JS_DIR/nuclei_exposure.txt")
+[$(TS)] [SUMMARY] Dalfox XSS:         $(count_lines "$JS_DIR/dalfox_findings.txt")
 [$(TS)] [SUMMARY] Elapsed:             $ELAPSED_FMT
 [$(TS)] ============================================"
 echo "$SUMMARY" >> "$LOG_FILE"
@@ -728,6 +901,14 @@ printf "  %-28s %s\n" "All live web:"       "$(count_lines "$OUT_DIR/all_web_ali
 printf "  %-28s %s\n" "Unique URLs:"        "$(count_lines "$OUT_DIR/clean_urls.txt")"
 printf "  %-28s %s\n" "JS files:"           "$(count_lines "$OUT_DIR/js_urls.txt")"
 printf "  %-28s %s\n" "URLs w/ params:"     "$(count_lines "$OUT_DIR/final_params.txt")"
+if [ "$ENABLE_JS" = "true" ]; then
+echo -e "${CYAN}${BOLD}  ── JS Analysis ──────────────────────────────${RESET}"
+printf "  %-28s %s\n" "JS endpoints:"       "$(count_lines "$JS_DIR/linkfinder_endpoints.txt")"
+printf "  %-28s %s\n" "JS secrets:"         "$(count_lines "$JS_DIR/secretfinder_out.txt")"
+printf "  %-28s %s\n" "TruffleHog hits:"    "$(count_lines "$JS_DIR/trufflehog_hits.txt")"
+printf "  %-28s %s\n" "Nuclei JS findings:" "$(count_lines "$JS_DIR/nuclei_exposure.txt")"
+printf "  %-28s %s\n" "Dalfox XSS:"        "$(count_lines "$JS_DIR/dalfox_findings.txt")"
+fi
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e "  ${BOLD}Output :${RESET} $OUT_DIR"
 echo -e "  ${BOLD}Log    :${RESET} $LOG_FILE"
